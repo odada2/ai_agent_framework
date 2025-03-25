@@ -1,0 +1,43 @@
+# Default Configuration for AI Agent Framework
+
+# LLM Configuration
+llm:
+  default_provider: "claude"
+  temperature: 0.7
+  max_tokens: 1000
+  
+  claude:
+    model_name: "claude-3-7-sonnet-20250219"
+    timeout: 30
+    context_window: 200000
+
+# Agent Configuration
+agent:
+  default_max_iterations: 10
+  verbose: false
+  include_timestamps: true
+  system_prompt: "You are a helpful assistant that can use tools to accomplish tasks."
+
+# Memory Configuration
+memory:
+  max_messages: 100
+  include_system_messages: true
+
+# Tools Configuration
+tools:
+  enable_filesystem: false
+  enable_web_access: false
+  default_timeout: 5
+
+# Logging Configuration
+logging:
+  level: "INFO"
+  console_level: "INFO"
+  log_dir: "logs"
+  max_file_size_mb: 10
+  backup_count: 5
+
+# Workflow Configuration
+workflow:
+  max_steps: 10
+  record_inputs_outputs: true
