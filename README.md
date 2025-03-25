@@ -80,14 +80,18 @@ async def main():
     print(response["response"])
 
 asyncio.run(main())
+```
 
-
-### Command Line Interface
+## Command Line Interface
 The framework includes a command-line interface for interacting with agents:
 
+```bash
 python -m ai_agent_framework.main interactive --agent-type workflow --enable-filesystem
+```
 
 ### Creating Custom Workflows
+
+```bash
 from ai_agent_framework.core.workflow.chain import PromptChain
 
 custom_workflow = PromptChain(
@@ -107,20 +111,28 @@ custom_workflow = PromptChain(
 )
 
 agent.add_workflow("custom", custom_workflow)
+```
 
-### Development
-## Running Tests
+## Development
+### Running Tests
 
+```bash
 pytest ai_agent_framework/tests/
+```
 
 ### Code Style
 The project follows PEP 8 style guidelines with a line length of 88 characters, using Black for formatting and isort for import sorting.
 
-# Format code
+### Format code
+
+```bash
 black ai_agent_framework/
 isort ai_agent_framework/
 
-### License
-This project is licensed under the MIT License - see the LICENSE file for details.##
-## Acknowledgements
+```
+
+## License
+This project is licensed under the MIT License - see the LICENSE file for details.
+
+# Acknowledgements
 This framework is inspired by Anthropic's research on building effective AI agents, emphasizing simple composable patterns over complex frameworks.
