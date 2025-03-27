@@ -22,12 +22,45 @@ agent:
 memory:
   max_messages: 100
   include_system_messages: true
+  
+  # Vector memory configuration
+  vector_memory:
+    enabled: false
+    embedder_type: "openai"
+    vector_store_type: "faiss"
+    search_k: 5
+    use_for_conversation_history: false
+
+# Vector Store Configuration
+vector_store:
+  default_type: "chroma" 
+  embedding_type: "openai"
+  persist_directory: "./data/vector_store"
+  chunk_size: 1000
+  chunk_overlap: 200
+  
+  # Text splitting defaults
+  text_splitter:
+    recursive_character:
+      separators: ["\n\n", "\n", ". ", " ", ""]
+    markdown:
+      heading_boost: true
+    html:
+      strip_tags: true
 
 # Tools Configuration
 tools:
   enable_filesystem: false
   enable_web_access: false
+  enable_knowledge_base: false
+  enable_conversation_memory: false
   default_timeout: 5
+
+  knowledge_base:
+    path: "./data/knowledge_base"
+    default_collection: "default"
+    auto_chunk: true
+    max_chunk_size: 1000
 
 # Logging Configuration
 logging:

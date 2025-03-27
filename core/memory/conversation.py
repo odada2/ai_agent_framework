@@ -1,13 +1,18 @@
 """
 Conversation Memory
 
-This module provides functionality for storing and managing conversation history.
+This module provides functionality for storing and managing conversation history,
+with optional vector storage for semantic search capabilities.
 """
 
 import json
 import logging
 import time
-from typing import Any, Dict, List, Optional, Union
+from typing import Dict, List, Optional, Any, Union, Tuple
+from datetime import datetime
+
+from .vector_store import Document, VectorStore, get_vector_store
+from .embeddings import get_embedder, Embedder
 
 logger = logging.getLogger(__name__)
 
@@ -17,14 +22,21 @@ class ConversationMemory:
     Manages conversation history for an agent.
     
     This class handles storing, retrieving, and managing messages in a conversation,
-    with support for summarization and selective retention.
+    with support for summarization, selective retention, and optional vector-based
+    semantic search for conversation history.
     """
     
     def __init__(
         self,
         max_messages: int = 100,
         max_tokens: Optional[int] = None,
-        include_timestamps: bool = True
+        include_timestamps: bool = True,
+        use_vector_storage: bool = False,
+        vector_store: Optional[VectorStore] = None,
+        vector_store_type: str = "faiss",
+        embedder: Optional[Embedder] = None,
+        embedder_type: str = "openai",
+        persist_path: Optional[str] = None
     ):
         """
         Initialize the conversation memory.
@@ -33,6 +45,12 @@ class ConversationMemory:
             max_messages: Maximum number of messages to store
             max_tokens: Optional maximum total tokens to store (requires token counting)
             include_timestamps: Whether to include timestamps with messages
+            use_vector_storage: Whether to use vector storage for semantic search
+            vector_store: Optional pre-configured vector store
+            vector_store_type: Type of vector store to create if none provided
+            embedder: Optional pre-configured embedder
+            embedder_type: Type of embedder to create if none provided
+            persist_path: Path to persist vector storage data
         """
         self.max_messages = max_messages
         self.max_tokens = max_tokens
@@ -41,6 +59,29 @@ class ConversationMemory:
         self.messages: List[Dict[str, Any]] = []
         self.summaries: List[Dict[str, Any]] = []
         self.total_tokens: int = 0
+        
+        # Set up vector storage if enabled
+        self.use_vector_storage = use_vector_storage
+        self.vector_store = None
+        self.embedder = None
+        
+        if self.use_vector_storage:
+            # Initialize embedder
+            self.embedder = embedder or get_embedder(embedder_type)
+            
+            # Initialize vector store
+            if vector_store:
+                self.vector_store = vector_store
+            else:
+                self.vector_store = get_vector_store(
+                    vector_store_type=vector_store_type,
+                    embedder=self.embedder,
+                    persist_directory=persist_path,
+                    collection_name="conversation_memory"
+                )
+        
+        # Track indexed message IDs
+        self.indexed_message_ids = set()
     
     def add_message(
         self,
@@ -56,7 +97,11 @@ class ConversationMemory:
             role: The role of the message sender (e.g., 'user', 'assistant')
             metadata: Optional additional metadata for the message
         """
+        # Generate a unique ID for the message
+        message_id = f"{role}_{int(time.time() * 1000)}_{len(self.messages)}"
+        
         message = {
+            "id": message_id,
             "role": role,
             "content": content,
             "metadata": metadata or {}
@@ -65,8 +110,8 @@ class ConversationMemory:
         if self.include_timestamps:
             message["timestamp"] = time.time()
         
-        # Calculate tokens if max_tokens is set
-        # In production, you would use a proper tokenizer here
+        # Calculate approximate tokens
+        # In production, use a proper tokenizer here
         approximate_tokens = len(content.split())
         
         # Check if we need to make room by pruning old messages
@@ -75,8 +120,42 @@ class ConversationMemory:
         ):
             self._prune_history()
         
+        # Add message to list
         self.messages.append(message)
         self.total_tokens += approximate_tokens
+        
+        # Add to vector store if enabled
+        if self.use_vector_storage and self.vector_store:
+            self._index_message(message)
+    
+    async def _index_message(self, message: Dict[str, Any]) -> None:
+        """
+        Index a message in the vector store.
+        
+        Args:
+            message: Message dict to index
+        """
+        try:
+            # Create a document
+            doc = Document(
+                text=message["content"],
+                metadata={
+                    "role": message["role"],
+                    "message_id": message["id"],
+                    "timestamp": message.get("timestamp", time.time()),
+                    "index": len(self.messages) - 1
+                },
+                id=message["id"]
+            )
+            
+            # Add to vector store
+            await self.vector_store.add_documents([doc])
+            
+            # Track indexed message
+            self.indexed_message_ids.add(message["id"])
+            
+        except Exception as e:
+            logger.error(f"Error indexing message in vector store: {str(e)}")
     
     def add_system_message(self, content: str, metadata: Optional[Dict[str, Any]] = None) -> None:
         """
@@ -137,10 +216,13 @@ class ConversationMemory:
         
         # Remove metadata if not requested
         if not include_metadata:
+            result_messages = []
             for message in filtered_messages:
-                if "metadata" in message:
-                    message = message.copy()
-                    del message["metadata"]
+                message_copy = message.copy()
+                if "metadata" in message_copy:
+                    del message_copy["metadata"]
+                result_messages.append(message_copy)
+            return result_messages
         
         return filtered_messages
     
@@ -184,6 +266,72 @@ class ConversationMemory:
         else:
             logger.warning(f"Unsupported format type: {format_type}, defaulting to string")
             return self.get_conversation_history(format_type="string", count=count)
+    
+    async def search_history(
+        self,
+        query: str,
+        k: int = 5,
+        filter: Optional[Dict[str, Any]] = None
+    ) -> List[Dict[str, Any]]:
+        """
+        Search conversation history using semantic similarity.
+        
+        Args:
+            query: Search query
+            k: Number of results to return
+            filter: Optional metadata filter
+            
+        Returns:
+            List of matching messages with similarity scores
+        """
+        if not self.use_vector_storage or not self.vector_store:
+            logger.warning("Vector storage not enabled, returning empty results")
+            return []
+        
+        try:
+            # Search vector store
+            results = await self.vector_store.similarity_search_with_score(
+                query=query,
+                k=k,
+                filter=filter
+            )
+            
+            # Format results
+            messages = []
+            for doc, score in results:
+                # Get index from metadata
+                index = doc.metadata.get("index")
+                message_id = doc.metadata.get("message_id")
+                
+                # Try to find original message
+                original_message = None
+                if index is not None and 0 <= index < len(self.messages):
+                    original_message = self.messages[index]
+                elif message_id:
+                    for msg in self.messages:
+                        if msg.get("id") == message_id:
+                            original_message = msg
+                            break
+                
+                # Use document content if original message not found
+                if original_message:
+                    message = original_message.copy()
+                    message["score"] = score
+                else:
+                    message = {
+                        "role": doc.metadata.get("role", "unknown"),
+                        "content": doc.text,
+                        "metadata": doc.metadata,
+                        "score": score
+                    }
+                
+                messages.append(message)
+            
+            return messages
+            
+        except Exception as e:
+            logger.error(f"Error searching conversation history: {str(e)}")
+            return []
     
     def _prune_history(self) -> None:
         """
@@ -246,11 +394,19 @@ class ConversationMemory:
             "summary": summary_text
         }
     
-    def clear(self) -> None:
+    async def clear(self) -> None:
         """Clear all messages and summaries in the conversation memory."""
         self.messages = []
         self.summaries = []
         self.total_tokens = 0
+        
+        # Clear vector store if enabled
+        if self.use_vector_storage and self.vector_store:
+            try:
+                await self.vector_store.delete()
+                self.indexed_message_ids.clear()
+            except Exception as e:
+                logger.error(f"Error clearing vector store: {str(e)}")
     
     def save_to_file(self, filepath: str) -> None:
         """
@@ -262,7 +418,9 @@ class ConversationMemory:
         data = {
             "messages": self.messages,
             "summaries": self.summaries,
-            "total_tokens": self.total_tokens
+            "total_tokens": self.total_tokens,
+            "vector_storage_enabled": self.use_vector_storage,
+            "indexed_messages": list(self.indexed_message_ids)
         }
         
         with open(filepath, 'w') as f:
@@ -281,3 +439,13 @@ class ConversationMemory:
         self.messages = data.get("messages", [])
         self.summaries = data.get("summaries", [])
         self.total_tokens = data.get("total_tokens", 0)
+        
+        # Update indexed message tracking
+        if "indexed_messages" in data:
+            self.indexed_message_ids = set(data["indexed_messages"])
+        
+        # Index messages in vector store if needed
+        if self.use_vector_storage and self.vector_store:
+            for message in self.messages:
+                if message.get("id") not in self.indexed_message_ids:
+                    self._index_message(message)

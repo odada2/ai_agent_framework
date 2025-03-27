@@ -10,6 +10,7 @@ AI Agent Framework provides a set of building blocks for creating AI agents that
 - Use tools to accomplish tasks
 - Maintain conversation context
 - Follow structured workflows
+- Access external knowledge through retrieval-augmented generation (RAG)
 - Make decisions and adapt to user requests
 
 The framework follows these core principles:
@@ -27,6 +28,7 @@ The framework is organized around these core components:
 - **Tool System**: Define, use, and manage tools for agent capabilities
 - **Memory Management**: Store conversation history and knowledge
 - **Workflow Patterns**: Structured patterns for agent execution flows
+- **Vector Database**: Store and retrieve information using semantic search
 
 ### Agent Types
 
@@ -53,7 +55,15 @@ pip install -r requirements.txt
 # Development installation
 pip install -e ".[dev]"
 
+# With vector store support
+pip install -e ".[vector]"
+
+# All features
+pip install -e ".[all]"
+```
+
 ### Quick Start
+```python
 import asyncio
 from ai_agent_framework.core.llm.factory import LLMFactory
 from ai_agent_framework.agents.workflow_agent import WorkflowAgent
@@ -86,12 +96,22 @@ asyncio.run(main())
 The framework includes a command-line interface for interacting with agents:
 
 ```bash
+# Interactive mode
 python -m ai_agent_framework.main interactive --agent-type workflow --enable-filesystem
+
+# With knowledge base
+python -m ai_agent_framework.main interactive --agent-type workflow --enable-knowledge-base --knowledge-base-path ./data/kb
+
+# Import knowledge
+python -m ai_agent_framework.main knowledge import --directory ./docs --recursive
+
+# Search knowledge
+python -m ai_agent_framework.main knowledge search --query "workflow patterns"
 ```
 
 ### Creating Custom Workflows
 
-```bash
+```python
 from ai_agent_framework.core.workflow.chain import PromptChain
 
 custom_workflow = PromptChain(
@@ -111,6 +131,34 @@ custom_workflow = PromptChain(
 )
 
 agent.add_workflow("custom", custom_workflow)
+```
+
+### Using Retrieval-Augmented Generation (RAG)
+
+```python
+from ai_agent_framework.core.memory.knowledge_base import KnowledgeBase
+from ai_agent_framework.tools.memory.retrieval_tool import RetrievalTool
+
+# Create a knowledge base
+kb = KnowledgeBase(
+    name="project_docs",
+    vector_store_type="chroma",
+    persist_path="./data/knowledge"
+)
+
+# Add documents
+await kb.add_documents_from_directory(
+    directory="./docs",
+    recursive=True
+)
+
+# Create retrieval tool
+retrieval_tool = RetrievalTool(
+    vector_store=kb.vector_store
+)
+
+# Add to agent
+tools.register_tool(retrieval_tool)
 ```
 
 ## Development
