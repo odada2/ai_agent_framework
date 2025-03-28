@@ -8,8 +8,9 @@ multiple specialized agents to accomplish complex tasks.
 import asyncio
 import json
 import logging
+import re
 import time
-from typing import Any, Dict, List, Optional, Union, Set
+from typing import Dict, List, Optional, Union, Set, Tuple, Any, Callable
 
 from ..core.llm.base import BaseLLM
 from ..core.memory.conversation import ConversationMemory
@@ -20,6 +21,7 @@ from ..core.communication.agent_protocol import (
 )
 from ..core.workflow.orchestrator import OrchestratorWorkflow
 from .base_agent import BaseAgent
+from ..config.settings import Settings
 
 logger = logging.getLogger(__name__)
 
@@ -48,6 +50,7 @@ class SupervisorAgent(BaseAgent):
         verbose: bool = False,
         parallel_execution: bool = True,
         max_parallel_agents: int = 3,
+        task_timeout: Optional[float] = None,
         **kwargs
     ):
         """
@@ -64,6 +67,7 @@ class SupervisorAgent(BaseAgent):
             verbose: Whether to log detailed information about the agent's operations
             parallel_execution: Whether to allow parallel execution of subtasks
             max_parallel_agents: Maximum number of agents to run in parallel
+            task_timeout: Default timeout for agent tasks in seconds (None = no timeout)
             **kwargs: Additional agent-specific parameters
         """
         # Create default system prompt if not provided
@@ -91,6 +95,19 @@ class SupervisorAgent(BaseAgent):
         self.specialized_agents = specialized_agents
         self.parallel_execution = parallel_execution
         self.max_parallel_agents = max_parallel_agents
+        self.task_timeout = task_timeout
+        
+        # Load configuration if available
+        try:
+            settings = Settings()
+            self.task_timeout = task_timeout or settings.get("orchestration.default_timeout", 60)
+            self.max_parallel_agents = settings.get("orchestration.max_parallel_workers", max_parallel_agents)
+            self.worker_retry_attempts = settings.get("orchestration.worker_retry_attempts", 3)
+            self.enable_fault_tolerance = settings.get("orchestration.enable_fault_tolerance", True)
+        except Exception as e:
+            logger.warning(f"Failed to load orchestration settings: {str(e)}")
+            self.worker_retry_attempts = 3
+            self.enable_fault_tolerance = True
         
         # Set up communication
         self.communicator = AgentCommunicator(agent_id=self.id)
@@ -156,7 +173,7 @@ class SupervisorAgent(BaseAgent):
             **kwargs: Additional runtime parameters
             
         Returns:
-            A dictionary containing the agent's response and any additional metadata
+            A dictionary containing the agent's response and additional metadata
         """
         # Reset for a new run
         self.reset()
@@ -336,7 +353,7 @@ class SupervisorAgent(BaseAgent):
             Tuple of (agent_id, reformulated_task) or (None, original_task)
         """
         # Increment iteration counter
-        if not self._increment_iteration():
+        if not self._increment_step():
             return None, task
         
         # Construct agent descriptions for the prompt

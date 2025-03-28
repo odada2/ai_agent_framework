@@ -1,76 +1,190 @@
-# Default Configuration for AI Agent Framework
+###################################
+# Default Configuration
+###################################
 
-# LLM Configuration
-llm:
-  default_provider: "claude"
-  temperature: 0.7
-  max_tokens: 1000
+# System-wide settings
+system:
+  name: "agent-orchestration-system"
+  version: "1.0.0"
+  log_level: "INFO"
+  environment: "development"  # development, staging, production
+
+# Agent settings
+agents:
+  # Task execution agent
+  task_executor:
+    type: "agents.executor.TaskExecutorAgent"
+    capabilities:
+      - "task_execution"
+      - "data_processing"
+    max_concurrent_tasks: 5
+    timeout: 300  # seconds
+    retry_delay: 5
+
+  # Data processing agent
+  data_processor:
+    type: "agents.processor.DataProcessorAgent"
+    capabilities:
+      - "data_processing"
+      - "data_transformation"
+      - "data_validation"
+    max_concurrent_tasks: 3
+    timeout: 600  # seconds
+    retry_delay: 10
+
+  # API agent for external services
+  api_agent:
+    type: "agents.external.APIAgent"
+    capabilities:
+      - "api_integration"
+      - "external_communication"
+    max_concurrent_tasks: 10
+    timeout: 120  # seconds
+    retry_delay: 3
+    rate_limit: 100  # requests per minute
+
+  # Supervisor agent
+  supervisor:
+    type: "agents.supervisor.SupervisorAgent"
+    max_retries: 3
+    retry_delay: 5
+    monitoring_interval: 30  # seconds
+
+# Orchestration configuration
+orchestration:
+  # Max number of concurrent workflows
+  max_concurrent_workflows: 10
   
-  claude:
-    model_name: "claude-3-7-sonnet-20250219"
-    timeout: 30
-    context_window: 200000
-
-# Agent Configuration
-agent:
-  default_max_iterations: 10
-  verbose: false
-  include_timestamps: true
-  system_prompt: "You are a helpful assistant that can use tools to accomplish tasks."
-
-# Memory Configuration
-memory:
-  max_messages: 100
-  include_system_messages: true
+  # Retry configuration
+  max_retries: 3
+  retry_delay: 5  # seconds
   
-  # Vector memory configuration
-  vector_memory:
-    enabled: false
-    embedder_type: "openai"
-    vector_store_type: "faiss"
-    search_k: 5
-    use_for_conversation_history: false
-
-# Vector Store Configuration
-vector_store:
-  default_type: "chroma" 
-  embedding_type: "openai"
-  persist_directory: "./data/vector_store"
-  chunk_size: 1000
-  chunk_overlap: 200
+  # Monitoring interval
+  monitoring_interval: 10  # seconds
   
-  # Text splitting defaults
-  text_splitter:
-    recursive_character:
-      separators: ["\n\n", "\n", ". ", " ", ""]
-    markdown:
-      heading_boost: true
-    html:
-      strip_tags: true
+  # Task prioritization strategy
+  # Options: fifo, deadline, priority
+  priority_strategy: "fifo"
+  
+  # Worker selection strategy
+  # Options: round_robin, least_loaded, capability_match
+  worker_selection_strategy: "capability_match"
+  
+  # Fault tolerance settings
+  enable_fault_tolerance: true
+  heartbeat_timeout: 300  # seconds (5 minutes)
+  
+  # Default workflow timeout
+  default_workflow_timeout: 3600  # seconds (1 hour)
+  
+  # Worker nodes configuration
+  workers:
+    - id: "worker-1"
+      endpoint: "http://localhost:8001/api/worker"
+      capabilities:
+        - "task_execution"
+        - "data_processing"
+      max_concurrent_tasks: 5
+    
+    - id: "worker-2"
+      endpoint: "http://localhost:8002/api/worker"
+      capabilities:
+        - "data_processing"
+        - "data_transformation"
+        - "data_validation"
+      max_concurrent_tasks: 3
+    
+    - id: "worker-3"
+      endpoint: "http://localhost:8003/api/worker"
+      capabilities:
+        - "api_integration"
+        - "external_communication"
+      max_concurrent_tasks: 10
 
-# Tools Configuration
-tools:
-  enable_filesystem: false
-  enable_web_access: false
-  enable_knowledge_base: false
-  enable_conversation_memory: false
-  default_timeout: 5
+# Communication settings
+communication:
+  # Protocol settings
+  protocol:
+    request_timeout: 30  # seconds
+    max_retries: 3
+    retry_backoff: 2.0  # exponential backoff factor
+  
+  # Security settings
+  security:
+    enable_encryption: true
+    encryption_algorithm: "AES-256"
+    enable_authentication: true
+    token_expiration: 3600  # seconds
+  
+  # Message queue settings
+  queue:
+    max_queue_size: 1000
+    processing_threads: 4
+    message_ttl: 300  # seconds
 
-  knowledge_base:
-    path: "./data/knowledge_base"
-    default_collection: "default"
-    auto_chunk: true
-    max_chunk_size: 1000
+# Storage settings
+storage:
+  # Database settings
+  database:
+    type: "sqlite"  # sqlite, postgresql, mongodb
+    path: "./data/storage.db"
+    connection_timeout: 30
+    connection_retries: 3
+  
+  # File storage settings
+  file_storage:
+    path: "./data/files"
+    max_size: 1073741824  # 1GB in bytes
 
-# Logging Configuration
+# Logging configuration
 logging:
-  level: "INFO"
-  console_level: "INFO"
-  log_dir: "logs"
-  max_file_size_mb: 10
-  backup_count: 5
+  console:
+    enabled: true
+    level: "INFO"
+    format: "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+  
+  file:
+    enabled: true
+    level: "DEBUG"
+    path: "./logs/application.log"
+    max_size: 10485760  # 10MB in bytes
+    backup_count: 5
+    format: "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+  
+  telemetry:
+    enabled: true
+    level: "INFO"
+    endpoint: "http://localhost:9000/telemetry"
 
-# Workflow Configuration
-workflow:
-  max_steps: 10
-  record_inputs_outputs: true
+# Task execution settings
+task_execution:
+  # Task timeout settings
+  default_timeout: 300  # seconds
+  max_timeout: 1800  # seconds (30 minutes)
+  
+  # Resource limits
+  cpu_limit: 0.8  # percentage of CPU resources
+  memory_limit: 1073741824  # 1GB in bytes
+  
+  # Dependency resolution
+  resolve_dependencies: true
+  dependency_resolution_timeout: 120  # seconds
+
+# Security settings
+security:
+  # Authentication
+  authentication:
+    enabled: true
+    provider: "jwt"  # jwt, oauth2, basic
+    token_expiration: 3600  # seconds
+  
+  # Authorization
+  authorization:
+    enabled: true
+    default_policy: "deny"  # deny, allow
+  
+  # Encryption
+  encryption:
+    enabled: true
+    algorithm: "AES-256"
+    key_rotation_interval: 86400  # seconds (1 day)

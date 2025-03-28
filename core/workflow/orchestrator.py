@@ -1,517 +1,749 @@
 """
-Orchestrator Workflow Pattern
+Workflow Orchestrator Module
 
-This module implements the orchestrator workflow pattern, which coordinates
-multiple specialized workers to accomplish complex tasks.
+This module provides the Orchestrator class that manages the execution of workflows,
+handling task scheduling, worker allocation, and error recovery mechanisms.
+
+The Orchestrator supports distributed execution across multiple worker nodes and
+implements fault tolerance strategies to ensure reliable workflow completion.
 """
 
-import asyncio
-import logging
+import os
 import time
-from typing import Any, Dict, List, Optional, Union, Callable
+import json
+import logging
+import threading
+import traceback
+from typing import Dict, List, Any, Optional, Tuple, Union, Callable
 
-from ..llm.base import BaseLLM
-from ..tools.registry import ToolRegistry
-from .base import BaseWorkflow
+# Core imports
+from core.workflow.task import Task, TaskStatus
+from core.workflow.workflow import Workflow
+from core.communication.agent_protocol import AgentMessage, AgentProtocol
+from core.exceptions import OrchestratorError, WorkerError, SchedulingError
+from core.utils.telemetry import TelemetryTracker
+
+# Worker pool management
+from core.workflow.worker_pool import WorkerPool, Worker, WorkerStatus
+
+# Configuration management
+from config.settings import Settings
 
 logger = logging.getLogger(__name__)
 
-
-class OrchestratorWorkflow(BaseWorkflow):
+class Orchestrator:
     """
-    Implementation of the orchestrator workflow pattern.
+    Workflow Orchestrator manages the execution of tasks across a pool of workers.
     
-    This workflow manages multiple worker agents/workflows, delegating subtasks
-    to the most appropriate worker and synthesizing their results.
+    The Orchestrator is responsible for:
+    1. Distributing tasks to appropriate workers
+    2. Tracking workflow execution progress
+    3. Handling failures and implementing recovery strategies
+    4. Optimizing resource utilization
+    5. Collecting execution metrics
     
-    Features:
-    - Central coordination of specialized workers
-    - Intelligent task decomposition and delegation
-    - Result aggregation and synthesis
-    - Parallel execution options
+    Attributes:
+        name (str): Name identifier for the orchestrator
+        worker_pool (WorkerPool): Pool of available worker nodes
+        protocol (AgentProtocol): Communication protocol
+        settings (Settings): Configuration settings
+        active_workflows (Dict[str, Workflow]): Currently running workflows
+        telemetry (TelemetryTracker): Performance metrics tracker
     """
     
     def __init__(
-        self,
+        self, 
         name: str,
-        llm: BaseLLM,
-        workers: Dict[str, Union[BaseWorkflow, Callable]],
-        tools: Optional[ToolRegistry] = None,
-        max_steps: int = 15,
-        parallel: bool = True,
-        max_parallel_workers: int = 3,
-        system_prompt: Optional[str] = None,
-        verbose: bool = False
+        settings_path: Optional[str] = None,
+        protocol: Optional[AgentProtocol] = None,
     ):
         """
-        Initialize the orchestrator workflow.
+        Initialize a new Orchestrator.
         
         Args:
-            name: Name of the workflow
-            llm: LLM instance for the orchestrator
-            workers: Dictionary of worker workflows/agents to coordinate
-            tools: Optional tool registry for the orchestrator's own tools
-            max_steps: Maximum number of orchestration steps
-            parallel: Whether to allow parallel execution of workers
-            max_parallel_workers: Maximum workers to run in parallel
-            system_prompt: Optional system prompt for the orchestrator
-            verbose: Whether to log detailed information
+            name: Unique identifier for this orchestrator
+            settings_path: Path to settings file (if None, uses default)
+            protocol: Communication protocol for worker messaging
         """
-        super().__init__(
-            name=name,
-            max_steps=max_steps,
-            verbose=verbose
+        self.name = name
+        self.settings = Settings(settings_path)
+        self.protocol = protocol or AgentProtocol()
+        self.worker_pool = WorkerPool()
+        self.active_workflows: Dict[str, Workflow] = {}
+        self.completed_workflows: Dict[str, Workflow] = {}
+        self.failed_workflows: Dict[str, Workflow] = {}
+        self.telemetry = TelemetryTracker()
+        
+        # Thread-safety for workflow operations
+        self._workflows_lock = threading.RLock()
+        
+        # Scheduling configuration
+        self._load_orchestration_config()
+        
+        # Start the background monitoring thread
+        self._stop_monitoring = threading.Event()
+        self._monitoring_thread = threading.Thread(
+            target=self._monitor_workflows,
+            daemon=True,
+            name=f"{self.name}-monitor"
         )
+        self._monitoring_thread.start()
         
-        self.llm = llm
-        self.workers = workers
-        self.tools = tools or ToolRegistry()
-        self.parallel = parallel
-        self.max_parallel_workers = max_parallel_workers
-        self.system_prompt = system_prompt or self._default_system_prompt()
-        
-        # Execution state
-        self.task_results = {}
-        self.pending_tasks = {}
-        self.completed_workers = set()
-        
-        # Validate workers
-        self._validate_workers()
+        logger.info(f"Orchestrator '{name}' initialized")
     
-    def _default_system_prompt(self) -> str:
-        """Provide a default system prompt for the orchestrator."""
-        return (
-            "You are an orchestrator responsible for coordinating multiple specialized agents. "
-            "Your job is to break down complex tasks into subtasks, delegate them to appropriate agents, "
-            "and synthesize their results into a coherent response. "
-            "Think carefully about which agent is best suited for each subtask."
-        )
-    
-    def _validate_workers(self) -> None:
-        """Validate that workers are properly configured."""
-        for name, worker in self.workers.items():
-            if not isinstance(worker, (BaseWorkflow, Callable)):
-                raise ValueError(f"Worker '{name}' must be a BaseWorkflow instance or callable")
-    
-    async def execute(self, input_data: Any, **kwargs) -> Dict[str, Any]:
+    def _load_orchestration_config(self) -> None:
         """
-        Execute the orchestrator workflow.
+        Load orchestration configuration from settings.
         
-        The orchestrator:
-        1. Analyzes the task
-        2. Breaks it into subtasks
-        3. Assigns subtasks to appropriate workers
-        4. Monitors execution
-        5. Synthesizes results
-        
-        Args:
-            input_data: Input data for the workflow
-            **kwargs: Additional execution parameters
-            
-        Returns:
-            Dict containing the execution results
+        Initializes scheduling parameters, worker configurations, and fault tolerance settings.
         """
-        self.reset()
-        
-        # Extract the task
-        if isinstance(input_data, str):
-            task = input_data
-            context = {}
-        elif isinstance(input_data, dict):
-            task = input_data.get("input", str(input_data))
-            context = input_data
-        else:
-            task = str(input_data)
-            context = {}
-        
-        # Initialize result structure
-        result = {
-            "input": task,
-            "subtasks": [],
-            "worker_results": {},
-            "final_result": None
-        }
-        
         try:
-            # Step 1: Task Analysis and Decomposition
-            subtasks = await self._analyze_and_decompose_task(task, context)
-            result["subtasks"] = subtasks
+            # Load orchestration settings
+            orch_config = self.settings.get("orchestration", {})
             
-            if self.verbose:
-                logger.info(f"Decomposed task into {len(subtasks)} subtasks")
+            # Configure scheduling parameters
+            self.max_concurrent_workflows = orch_config.get("max_concurrent_workflows", 10)
+            self.max_retries = orch_config.get("max_retries", 3)
+            self.retry_delay = orch_config.get("retry_delay", 5)
+            self.monitoring_interval = orch_config.get("monitoring_interval", 10)
             
-            # Step 2: Worker Assignment and Execution
-            if self.parallel:
-                worker_results = await self._execute_workers_parallel(subtasks, context)
+            # Task prioritization strategy
+            priority_strategy = orch_config.get("priority_strategy", "fifo")
+            if priority_strategy == "fifo":
+                self._prioritize_tasks = self._prioritize_fifo
+            elif priority_strategy == "deadline":
+                self._prioritize_tasks = self._prioritize_deadline
             else:
-                worker_results = await self._execute_workers_sequential(subtasks, context)
-                
-            result["worker_results"] = worker_results
+                logger.warning(f"Unknown priority strategy '{priority_strategy}', falling back to FIFO")
+                self._prioritize_tasks = self._prioritize_fifo
             
-            # Step 3: Result Synthesis
-            final_result = await self._synthesize_results(task, subtasks, worker_results, context)
-            result["final_result"] = final_result
+            # Worker selection strategy
+            worker_strategy = orch_config.get("worker_selection_strategy", "round_robin")
+            if worker_strategy == "round_robin":
+                self._select_worker = self._select_worker_round_robin
+            elif worker_strategy == "least_loaded":
+                self._select_worker = self._select_worker_least_loaded
+            elif worker_strategy == "capability_match":
+                self._select_worker = self._select_worker_capability_match
+            else:
+                logger.warning(f"Unknown worker selection strategy '{worker_strategy}', falling back to round-robin")
+                self._select_worker = self._select_worker_round_robin
             
-            self._mark_finished(success=True)
-            return result
+            # Initialize any additional components from config
+            self._initialize_workers_from_config(orch_config.get("workers", []))
+            
+            logger.info(f"Orchestration configuration loaded: {len(self.worker_pool.workers)} workers configured")
             
         except Exception as e:
-            logger.exception(f"Error in orchestrator workflow: {str(e)}")
-            self._mark_finished(success=False, error=str(e))
-            
-            result["error"] = str(e)
-            return result
+            logger.error(f"Error loading orchestration configuration: {str(e)}")
+            logger.debug(traceback.format_exc())
+            # Use default configurations
+            self.max_concurrent_workflows = 10
+            self.max_retries = 3
+            self.retry_delay = 5
+            self.monitoring_interval = 10
+            self._prioritize_tasks = self._prioritize_fifo
+            self._select_worker = self._select_worker_round_robin
     
-    async def _analyze_and_decompose_task(
-        self, 
-        task: str, 
-        context: Dict[str, Any]
-    ) -> List[Dict[str, Any]]:
+    def _initialize_workers_from_config(self, worker_configs: List[Dict[str, Any]]) -> None:
         """
-        Analyze the task and break it down into subtasks.
+        Initialize workers from configuration.
         
         Args:
-            task: The main task to decompose
-            context: Additional context
-            
-        Returns:
-            List of subtask specifications
+            worker_configs: List of worker configuration dictionaries
         """
-        # Construct analysis prompt
-        worker_descriptions = "\n".join([
-            f"- {name}: {self._get_worker_description(worker)}"
-            for name, worker in self.workers.items()
-        ])
-        
-        analysis_prompt = (
-            f"Task: {task}\n\n"
-            f"Available workers:\n{worker_descriptions}\n\n"
-            f"Break down this task into subtasks that can be delegated to the available workers. "
-            f"For each subtask, specify:\n"
-            f"1. A clear, specific subtask description\n"
-            f"2. Which worker should handle it\n"
-            f"3. The priority (1-5, where 1 is highest)\n"
-            f"4. Whether this subtask depends on the results of other subtasks\n\n"
-            f"Respond in the following JSON format:\n"
-            f"```json\n"
-            f'{{"subtasks": [\n'
-            f'  {{"id": "subtask1", "description": "...", "worker": "...", "priority": 1, "dependencies": []}},'
-            f'  {{"id": "subtask2", "description": "...", "worker": "...", "priority": 2, "dependencies": ["subtask1"]}}\n'
-            f']}}\n'
-            f"```\n\n"
-            f"Consider which tasks can be done in parallel and which need to be sequential. "
-            f"Ensure that each subtask is assigned to a suitable worker based on their capabilities."
-        )
-        
-        # Get LLM response
-        response = await self.llm.generate(
-            prompt=analysis_prompt,
-            system_prompt=self.system_prompt,
-            temperature=0.2  # Low temperature for more deterministic planning
-        )
-        
-        # Extract JSON from response
-        import json
-        import re
-        
-        response_text = response.get("content", "")
-        json_match = re.search(r"```(?:json)?\s*([\s\S]*?)\s*```", response_text)
-        
-        if json_match:
-            try:
-                data = json.loads(json_match.group(1))
-                return data.get("subtasks", [])
-            except json.JSONDecodeError:
-                logger.error("Failed to parse subtasks JSON")
-                
-                # Fallback: try to extract without code blocks
-                try:
-                    # Look for JSON object pattern
-                    alt_match = re.search(r"\{[\s\S]*\"subtasks\"[\s\S]*\}", response_text)
-                    if alt_match:
-                        data = json.loads(alt_match.group(0))
-                        return data.get("subtasks", [])
-                except Exception:
-                    pass
-        
-        # If parsing fails, create a simple fallback task for each worker
-        logger.warning("Using fallback task decomposition")
-        subtasks = []
-        for i, (name, _) in enumerate(self.workers.items()):
-            subtasks.append({
-                "id": f"subtask_{i+1}",
-                "description": task,
-                "worker": name,
-                "priority": i+1,
-                "dependencies": []
-            })
-        
-        return subtasks
-    
-    async def _execute_workers_sequential(
-        self, 
-        subtasks: List[Dict[str, Any]], 
-        context: Dict[str, Any]
-    ) -> Dict[str, Any]:
-        """
-        Execute workers sequentially based on priority and dependencies.
-        
-        Args:
-            subtasks: List of subtask specifications
-            context: Additional context
-            
-        Returns:
-            Dict of worker results
-        """
-        results = {}
-        completed_tasks = set()
-        
-        # Sort subtasks by priority and dependencies
-        sorted_subtasks = sorted(subtasks, key=lambda x: x.get("priority", 99))
-        
-        # Process subtasks in order
-        for subtask in sorted_subtasks:
-            subtask_id = subtask["id"]
-            worker_name = subtask["worker"]
-            description = subtask["description"]
-            dependencies = subtask.get("dependencies", [])
-            
-            # Skip if worker doesn't exist
-            if worker_name not in self.workers:
-                logger.warning(f"Worker '{worker_name}' not found, skipping subtask '{subtask_id}'")
+        for config in worker_configs:
+            worker_id = config.get("id")
+            if not worker_id:
+                logger.warning("Skipping worker with missing ID in configuration")
                 continue
-            
-            # Check dependencies
-            dependency_results = {}
-            all_deps_complete = True
-            
-            for dep_id in dependencies:
-                if dep_id not in completed_tasks:
-                    all_deps_complete = False
-                    logger.warning(f"Dependency '{dep_id}' not complete for subtask '{subtask_id}'")
-                    break
-                dependency_results[dep_id] = results.get(dep_id, {})
-            
-            if not all_deps_complete:
-                logger.warning(f"Skipping subtask '{subtask_id}' due to incomplete dependencies")
-                continue
-            
-            # Prepare input for worker
-            worker_input = {
-                "input": description,
-                "context": context,
-                "dependencies": dependency_results
-            }
-            
-            # Execute worker
-            worker = self.workers[worker_name]
+                
             try:
-                if self.verbose:
-                    logger.info(f"Executing worker '{worker_name}' for subtask '{subtask_id}'")
-                
-                # Increment step counter
-                if not self._increment_step():
-                    break
-                
-                # Execute worker (different handling for workflow vs callable)
-                if isinstance(worker, BaseWorkflow):
-                    worker_result = await worker.execute(worker_input)
-                else:
-                    # Assume it's a callable
-                    worker_result = await worker(worker_input)
-                
-                # Store result
-                results[subtask_id] = worker_result
-                completed_tasks.add(subtask_id)
-                self.completed_workers.add(worker_name)
-                
-                if self.verbose:
-                    logger.info(f"Completed worker '{worker_name}' for subtask '{subtask_id}'")
+                worker = Worker(
+                    id=worker_id,
+                    endpoint=config.get("endpoint"),
+                    capabilities=config.get("capabilities", []),
+                    max_concurrent_tasks=config.get("max_concurrent_tasks", 5)
+                )
+                self.worker_pool.add_worker(worker)
+                logger.info(f"Initialized worker '{worker_id}' from configuration")
                 
             except Exception as e:
-                logger.error(f"Error executing worker '{worker_name}': {str(e)}")
-                results[subtask_id] = {"error": str(e)}
-        
-        return results
+                logger.error(f"Failed to initialize worker '{worker_id}': {str(e)}")
     
-    async def _execute_workers_parallel(
-        self, 
-        subtasks: List[Dict[str, Any]], 
-        context: Dict[str, Any]
-    ) -> Dict[str, Any]:
+    def register_worker(self, worker: Worker) -> None:
         """
-        Execute workers in parallel when possible.
+        Register a new worker with the orchestrator.
         
         Args:
-            subtasks: List of subtask specifications
-            context: Additional context
+            worker: Worker instance to register
             
-        Returns:
-            Dict of worker results
+        Raises:
+            ValueError: If a worker with the same ID is already registered
         """
-        results = {}
-        completed_tasks = set()
-        dependency_map = {task["id"]: set(task.get("dependencies", [])) for task in subtasks}
-        
-        # Map subtasks to their workers
-        worker_map = {task["id"]: task["worker"] for task in subtasks}
-        description_map = {task["id"]: task["description"] for task in subtasks}
-        
-        # Process subtasks in waves based on dependencies
-        while len(completed_tasks) < len(subtasks) and self._increment_step():
-            # Find eligible tasks (dependencies satisfied)
-            eligible_tasks = []
-            
-            for task in subtasks:
-                task_id = task["id"]
-                
-                # Skip already completed tasks
-                if task_id in completed_tasks:
-                    continue
-                
-                # Check if all dependencies are satisfied
-                deps = dependency_map[task_id]
-                if all(dep in completed_tasks for dep in deps):
-                    eligible_tasks.append(task_id)
-            
-            if not eligible_tasks:
-                # Circular dependency or all tasks completed
-                break
-            
-            # Limit parallel execution
-            current_batch = eligible_tasks[:self.max_parallel_workers]
-            
-            # Prepare tasks
-            tasks = []
-            for task_id in current_batch:
-                worker_name = worker_map[task_id]
-                if worker_name not in self.workers:
-                    logger.warning(f"Worker '{worker_name}' not found, skipping subtask '{task_id}'")
-                    continue
-                
-                worker = self.workers[worker_name]
-                
-                # Gather dependency results
-                dependency_results = {}
-                for dep_id in dependency_map[task_id]:
-                    dependency_results[dep_id] = results.get(dep_id, {})
-                
-                # Prepare input
-                worker_input = {
-                    "input": description_map[task_id],
-                    "context": context,
-                    "dependencies": dependency_results,
-                    "subtask_id": task_id
-                }
-                
-                # Create task
-                if isinstance(worker, BaseWorkflow):
-                    task = worker.execute(worker_input)
-                else:
-                    # Assume it's a callable
-                    task = worker(worker_input)
-                
-                tasks.append((task_id, worker_name, task))
-            
-            # Execute batch in parallel
-            if self.verbose:
-                logger.info(f"Executing batch of {len(tasks)} tasks in parallel")
-            
-            # Create tasks for asyncio.gather
-            async_tasks = [task for _, _, task in tasks]
-            
-            # Wait for all tasks to complete
-            task_results = await asyncio.gather(*async_tasks, return_exceptions=True)
-            
-            # Process results
-            for i, (task_id, worker_name, _) in enumerate(tasks):
-                result = task_results[i]
-                
-                if isinstance(result, Exception):
-                    logger.error(f"Error executing worker '{worker_name}': {str(result)}")
-                    results[task_id] = {"error": str(result)}
-                else:
-                    results[task_id] = result
-                    self.completed_workers.add(worker_name)
-                
-                completed_tasks.add(task_id)
-                
-                if self.verbose:
-                    status = "completed" if not isinstance(result, Exception) else "failed"
-                    logger.info(f"Task '{task_id}' {status} by worker '{worker_name}'")
-        
-        return results
+        self.worker_pool.add_worker(worker)
+        logger.info(f"Worker '{worker.id}' registered with capabilities: {worker.capabilities}")
     
-    async def _synthesize_results(
-        self,
-        task: str,
-        subtasks: List[Dict[str, Any]],
-        worker_results: Dict[str, Any],
-        context: Dict[str, Any]
-    ) -> str:
+    def unregister_worker(self, worker_id: str) -> None:
         """
-        Synthesize worker results into a coherent response.
+        Unregister a worker from the orchestrator.
         
         Args:
-            task: Original task
-            subtasks: List of subtask specifications
-            worker_results: Results from workers
-            context: Additional context
+            worker_id: ID of the worker to unregister
+            
+        Raises:
+            ValueError: If the worker is not registered
+        """
+        self.worker_pool.remove_worker(worker_id)
+        logger.info(f"Worker '{worker_id}' unregistered")
+    
+    def submit_workflow(self, workflow: Workflow) -> str:
+        """
+        Submit a workflow for execution.
+        
+        Args:
+            workflow: The workflow to execute
             
         Returns:
-            Synthesized final result
+            ID of the submitted workflow
+            
+        Raises:
+            OrchestratorError: If the workflow cannot be submitted
         """
-        # Construct synthesis prompt
-        subtask_results = []
-        
-        for subtask in subtasks:
-            subtask_id = subtask["id"]
-            worker_name = subtask["worker"]
-            description = subtask["description"]
+        with self._workflows_lock:
+            # Check if we can accept more workflows
+            if len(self.active_workflows) >= self.max_concurrent_workflows:
+                raise OrchestratorError(
+                    f"Maximum concurrent workflows limit reached ({self.max_concurrent_workflows})"
+                )
             
-            # Get result if available
-            result = worker_results.get(subtask_id, {})
-            result_content = result.get("final_result", result)
+            # Check if workflow already exists
+            if workflow.id in self.active_workflows:
+                raise OrchestratorError(f"Workflow with ID '{workflow.id}' is already active")
             
-            if isinstance(result_content, dict) and "error" in result_content:
-                result_str = f"ERROR: {result_content['error']}"
-            elif isinstance(result_content, (dict, list)):
-                import json
-                result_str = json.dumps(result_content, indent=2)
-            else:
-                result_str = str(result_content)
+            # Add workflow to active workflows
+            self.active_workflows[workflow.id] = workflow
             
-            subtask_results.append(
-                f"Subtask: {description}\n"
-                f"Worker: {worker_name}\n"
-                f"Result:\n{result_str}\n"
-            )
-        
-        synthesis_prompt = (
-            f"Task: {task}\n\n"
-            f"You have coordinated multiple workers to address this task. "
-            f"Below are the results from each worker:\n\n"
-            f"{'-' * 40}\n"
-            f"{'\n' + '-' * 40 + '\n'.join(subtask_results)}\n"
-            f"{'-' * 40}\n\n"
-            f"Synthesize these results into a coherent, comprehensive response to the original task. "
-            f"Be sure to integrate the information from all workers, addressing any contradictions "
-            f"and filling in gaps. The final response should be concise but complete."
-        )
-        
-        # Get LLM response
-        response = await self.llm.generate(
-            prompt=synthesis_prompt,
-            system_prompt=self.system_prompt,
-            temperature=0.5  # Moderate temperature for creative synthesis
-        )
-        
-        return response.get("content", "Failed to synthesize results")
+            # Start telemetry tracking
+            self.telemetry.start_workflow(workflow.id)
+            
+            logger.info(f"Workflow '{workflow.id}' submitted with {len(workflow.tasks)} tasks")
+            
+            # Schedule initial tasks
+            self._schedule_ready_tasks(workflow)
+            
+            return workflow.id
     
-    def _get_worker_description(self, worker: Union[BaseWorkflow, Callable]) -> str:
-        """Get a description of a worker for task delegation."""
-        if isinstance(worker, BaseWorkflow):
-            return getattr(worker, 'description', f"Workflow: {worker.name}")
+    def _schedule_ready_tasks(self, workflow: Workflow) -> None:
+        """
+        Schedule all ready tasks in a workflow.
+        
+        Args:
+            workflow: The workflow containing tasks to schedule
+        """
+        # Find all tasks with PENDING status and no dependencies or all dependencies satisfied
+        ready_tasks = []
+        for task in workflow.tasks:
+            if task.status == TaskStatus.PENDING and self._are_dependencies_satisfied(workflow, task):
+                ready_tasks.append(task)
+        
+        if not ready_tasks:
+            logger.debug(f"No ready tasks to schedule in workflow '{workflow.id}'")
+            return
+        
+        # Prioritize tasks
+        prioritized_tasks = self._prioritize_tasks(ready_tasks)
+        
+        # Schedule each task
+        for task in prioritized_tasks:
+            self._schedule_task(workflow, task)
+    
+    def _are_dependencies_satisfied(self, workflow: Workflow, task: Task) -> bool:
+        """
+        Check if all dependencies of a task are satisfied.
+        
+        Args:
+            workflow: The workflow containing the task
+            task: The task to check dependencies for
+            
+        Returns:
+            True if all dependencies are satisfied, False otherwise
+        """
+        dependencies = task.metadata.get("dependencies", [])
+        if not dependencies:
+            return True
+            
+        # Check each dependency
+        for dep_id in dependencies:
+            # Find the dependency task
+            dep_task = next((t for t in workflow.tasks if t.id == dep_id), None)
+            if not dep_task:
+                logger.warning(f"Dependency '{dep_id}' not found for task '{task.id}'")
+                return False
+                
+            # Check if dependency is completed
+            if dep_task.status != TaskStatus.COMPLETED:
+                return False
+        
+        return True
+    
+    def _prioritize_fifo(self, tasks: List[Task]) -> List[Task]:
+        """
+        Prioritize tasks using First-In-First-Out strategy.
+        
+        Args:
+            tasks: List of tasks to prioritize
+            
+        Returns:
+            Prioritized list of tasks
+        """
+        # In FIFO, we don't change the order
+        return tasks
+    
+    def _prioritize_deadline(self, tasks: List[Task]) -> List[Task]:
+        """
+        Prioritize tasks based on deadline (earliest first).
+        
+        Args:
+            tasks: List of tasks to prioritize
+            
+        Returns:
+            Prioritized list of tasks
+        """
+        return sorted(
+            tasks,
+            key=lambda task: task.metadata.get("deadline", float("inf"))
+        )
+    
+    def _schedule_task(self, workflow: Workflow, task: Task) -> None:
+        """
+        Schedule a task for execution on a worker.
+        
+        Args:
+            workflow: The workflow containing the task
+            task: The task to schedule
+        """
+        # Select the best worker for this task
+        worker = self._select_worker(task)
+        if not worker:
+            logger.warning(f"No suitable worker found for task '{task.id}' in workflow '{workflow.id}'")
+            task.status = TaskStatus.FAILED
+            task.error = "No suitable worker available"
+            self._check_workflow_completion(workflow)
+            return
+        
+        # Update task status
+        task.status = TaskStatus.SCHEDULED
+        task.assigned_worker = worker.id
+        
+        # Start telemetry for this task
+        self.telemetry.start_task(workflow.id, task.id)
+        
+        # Create task execution message
+        task_message = AgentMessage(
+            sender=self.name,
+            recipient=worker.id,
+            content=task.to_dict(),
+            message_type="task_execute"
+        )
+        
+        # Send task to worker
+        try:
+            logger.info(f"Scheduling task '{task.id}' on worker '{worker.id}'")
+            self.protocol.send(task_message)
+            
+            # Update worker status
+            worker.active_tasks += 1
+            
+        except Exception as e:
+            logger.error(f"Failed to schedule task '{task.id}' on worker '{worker.id}': {str(e)}")
+            task.status = TaskStatus.FAILED
+            task.error = f"Scheduling failed: {str(e)}"
+            self._check_workflow_completion(workflow)
+    
+    def _select_worker_round_robin(self, task: Task) -> Optional[Worker]:
+        """
+        Select a worker using round-robin scheduling.
+        
+        Args:
+            task: The task to find a worker for
+            
+        Returns:
+            Selected worker or None if no suitable worker is found
+        """
+        return self.worker_pool.get_next_available_worker()
+    
+    def _select_worker_least_loaded(self, task: Task) -> Optional[Worker]:
+        """
+        Select the least loaded worker for a task.
+        
+        Args:
+            task: The task to find a worker for
+            
+        Returns:
+            Selected worker or None if no suitable worker is found
+        """
+        return self.worker_pool.get_least_loaded_worker()
+    
+    def _select_worker_capability_match(self, task: Task) -> Optional[Worker]:
+        """
+        Select a worker based on capability matching.
+        
+        This selects workers that match all required capabilities for the task,
+        prioritizing workers with the fewest extra capabilities (most specialized).
+        
+        Args:
+            task: The task to find a worker for
+            
+        Returns:
+            Selected worker or None if no suitable worker is found
+        """
+        required_capabilities = task.metadata.get("required_capabilities", [])
+        
+        # Find workers with all required capabilities
+        suitable_workers = []
+        for worker in self.worker_pool.get_available_workers():
+            if worker.status != WorkerStatus.ONLINE:
+                continue
+                
+            # Check if worker has all required capabilities
+            if all(cap in worker.capabilities for cap in required_capabilities):
+                # Calculate how specialized this worker is for the task
+                # (fewer extra capabilities = more specialized)
+                extra_capabilities = len(worker.capabilities) - len(required_capabilities)
+                suitable_workers.append((worker, extra_capabilities))
+        
+        if not suitable_workers:
+            return None
+            
+        # Sort by number of extra capabilities (ascending) and then by load (ascending)
+        suitable_workers.sort(key=lambda x: (x[1], x[0].active_tasks))
+        return suitable_workers[0][0]
+    
+    def handle_task_completion(self, worker_id: str, task_id: str, result: Any) -> None:
+        """
+        Handle the completion of a task.
+        
+        Args:
+            worker_id: ID of the worker that completed the task
+            task_id: ID of the completed task
+            result: Result data from the task
+        """
+        # Find the workflow and task
+        workflow = None
+        task = None
+        
+        with self._workflows_lock:
+            for wf in self.active_workflows.values():
+                for t in wf.tasks:
+                    if t.id == task_id:
+                        workflow = wf
+                        task = t
+                        break
+                if workflow:
+                    break
+        
+        if not workflow or not task:
+            logger.warning(f"Received completion for unknown task '{task_id}' from worker '{worker_id}'")
+            return
+            
+        # Update task status
+        task.status = TaskStatus.COMPLETED
+        task.result = result
+        
+        # Update worker status
+        worker = self.worker_pool.get_worker(worker_id)
+        if worker:
+            worker.active_tasks -= 1
+        
+        # Record completion in telemetry
+        self.telemetry.end_task(workflow.id, task.id)
+        
+        logger.info(f"Task '{task_id}' in workflow '{workflow.id}' completed by worker '{worker_id}'")
+        
+        # Schedule dependent tasks
+        self._schedule_ready_tasks(workflow)
+        
+        # Check if workflow is complete
+        self._check_workflow_completion(workflow)
+    
+    def handle_task_failure(self, worker_id: str, task_id: str, error: str) -> None:
+        """
+        Handle a task failure.
+        
+        Args:
+            worker_id: ID of the worker that reported the failure
+            task_id: ID of the failed task
+            error: Error message or description
+        """
+        # Find the workflow and task
+        workflow = None
+        task = None
+        
+        with self._workflows_lock:
+            for wf in self.active_workflows.values():
+                for t in wf.tasks:
+                    if t.id == task_id:
+                        workflow = wf
+                        task = t
+                        break
+                if workflow:
+                    break
+        
+        if not workflow or not task:
+            logger.warning(f"Received failure for unknown task '{task_id}' from worker '{worker_id}'")
+            return
+            
+        logger.warning(f"Task '{task_id}' in workflow '{workflow.id}' failed on worker '{worker_id}': {error}")
+        
+        # Update worker status
+        worker = self.worker_pool.get_worker(worker_id)
+        if worker:
+            worker.active_tasks -= 1
+        
+        # Check if we should retry
+        retry_count = task.metadata.get("retry_count", 0)
+        
+        if retry_count < self.max_retries:
+            # Update retry count
+            task.metadata["retry_count"] = retry_count + 1
+            
+            # Reset task status
+            task.status = TaskStatus.PENDING
+            task.assigned_worker = None
+            
+            logger.info(f"Retrying task '{task_id}' (attempt {retry_count + 1}/{self.max_retries})")
+            
+            # Wait before retrying
+            time.sleep(self.retry_delay)
+            
+            # Re-schedule the task
+            self._schedule_task(workflow, task)
+            
         else:
-            # For callables, use docstring or a default description
-            return worker.__doc__ or "Function-based worker"
+            # Mark task as failed
+            task.status = TaskStatus.FAILED
+            task.error = error
+            
+            # Record failure in telemetry
+            self.telemetry.record_task_failure(workflow.id, task.id, error)
+            
+            # Check if workflow needs to be marked as failed
+            self._check_workflow_completion(workflow)
+    
+    def _check_workflow_completion(self, workflow: Workflow) -> None:
+        """
+        Check if a workflow is complete or failed and update its status.
+        
+        A workflow is complete if all tasks are either completed or failed.
+        A workflow is failed if any task has failed and affects the critical path.
+        
+        Args:
+            workflow: The workflow to check
+        """
+        with self._workflows_lock:
+            # Check if any tasks are still in progress
+            in_progress = False
+            has_failed = False
+            
+            for task in workflow.tasks:
+                if task.status in [TaskStatus.PENDING, TaskStatus.SCHEDULED, TaskStatus.RUNNING]:
+                    in_progress = True
+                elif task.status == TaskStatus.FAILED:
+                    has_failed = True
+                    # Check if this failure affects the critical path
+                    if task.metadata.get("critical", False):
+                        # Mark workflow as failed
+                        workflow.status = "failed"
+                        
+                        # Move to failed workflows
+                        self.failed_workflows[workflow.id] = workflow
+                        if workflow.id in self.active_workflows:
+                            del self.active_workflows[workflow.id]
+                            
+                        logger.error(f"Workflow '{workflow.id}' failed due to critical task '{task.id}'")
+                        
+                        # End telemetry for this workflow
+                        self.telemetry.end_workflow(workflow.id)
+                        return
+            
+            # If no tasks are in progress, the workflow is complete
+            if not in_progress:
+                if has_failed:
+                    # Some non-critical tasks failed
+                    workflow.status = "completed_with_failures"
+                else:
+                    # All tasks completed successfully
+                    workflow.status = "completed"
+                
+                # Move to completed workflows
+                self.completed_workflows[workflow.id] = workflow
+                if workflow.id in self.active_workflows:
+                    del self.active_workflows[workflow.id]
+                    
+                # End telemetry for this workflow
+                self.telemetry.end_workflow(workflow.id)
+                
+                logger.info(f"Workflow '{workflow.id}' {workflow.status}")
+    
+    def _monitor_workflows(self) -> None:
+        """
+        Background thread that monitors workflow progress and handles timeouts.
+        """
+        while not self._stop_monitoring.is_set():
+            try:
+                with self._workflows_lock:
+                    current_time = time.time()
+                    
+                    # Check each active workflow
+                    for workflow_id, workflow in list(self.active_workflows.items()):
+                        # Check for workflow timeout
+                        if "timeout" in workflow.metadata:
+                            start_time = workflow.metadata.get("start_time", 0)
+                            timeout = workflow.metadata.get("timeout")
+                            
+                            if current_time - start_time > timeout:
+                                logger.warning(f"Workflow '{workflow_id}' timed out after {timeout}s")
+                                workflow.status = "timeout"
+                                
+                                # Move to failed workflows
+                                self.failed_workflows[workflow_id] = workflow
+                                del self.active_workflows[workflow_id]
+                                
+                                # End telemetry
+                                self.telemetry.end_workflow(workflow_id)
+                                continue
+                        
+                        # Check for task heartbeats and timeouts
+                        for task in workflow.tasks:
+                            if task.status == TaskStatus.RUNNING:
+                                # Check if task has a heartbeat timeout
+                                last_heartbeat = task.metadata.get("last_heartbeat", 0)
+                                heartbeat_timeout = task.metadata.get("heartbeat_timeout", 300)  # 5 minutes default
+                                
+                                if current_time - last_heartbeat > heartbeat_timeout:
+                                    logger.warning(f"Task '{task.id}' in workflow '{workflow_id}' missed heartbeat")
+                                    
+                                    # Mark task as failed
+                                    self.handle_task_failure(
+                                        task.assigned_worker or "unknown",
+                                        task.id,
+                                        "Task missed heartbeat timeout"
+                                    )
+                
+                # Sleep for monitoring interval
+                time.sleep(self.monitoring_interval)
+                
+            except Exception as e:
+                logger.error(f"Error in workflow monitoring thread: {str(e)}")
+                logger.debug(traceback.format_exc())
+                time.sleep(self.monitoring_interval)
+    
+    def get_workflow_status(self, workflow_id: str) -> Dict[str, Any]:
+        """
+        Get the current status of a workflow.
+        
+        Args:
+            workflow_id: ID of the workflow to check
+            
+        Returns:
+            Dict containing workflow status information
+            
+        Raises:
+            ValueError: If the workflow doesn't exist
+        """
+        # Check active workflows
+        if workflow_id in self.active_workflows:
+            workflow = self.active_workflows[workflow_id]
+        # Check completed workflows
+        elif workflow_id in self.completed_workflows:
+            workflow = self.completed_workflows[workflow_id]
+        # Check failed workflows
+        elif workflow_id in self.failed_workflows:
+            workflow = self.failed_workflows[workflow_id]
+        else:
+            raise ValueError(f"Workflow '{workflow_id}' not found")
+            
+        return {
+            "workflow_id": workflow_id,
+            "status": workflow.status,
+            "tasks": [
+                {
+                    "id": task.id,
+                    "status": task.status,
+                    "assigned_worker": task.assigned_worker,
+                    "has_error": task.error is not None
+                }
+                for task in workflow.tasks
+            ],
+            "metrics": self.telemetry.get_workflow_metrics(workflow_id)
+        }
+        
+    def cancel_workflow(self, workflow_id: str) -> None:
+        """
+        Cancel an in-progress workflow.
+        
+        Args:
+            workflow_id: ID of the workflow to cancel
+            
+        Raises:
+            ValueError: If the workflow doesn't exist
+        """
+        with self._workflows_lock:
+            if workflow_id not in self.active_workflows:
+                raise ValueError(f"Workflow '{workflow_id}' not found or not active")
+                
+            workflow = self.active_workflows[workflow_id]
+            
+            # Cancel any running or scheduled tasks
+            for task in workflow.tasks:
+                if task.status in [TaskStatus.SCHEDULED, TaskStatus.RUNNING]:
+                    # Try to send cancel message to the assigned worker
+                    if task.assigned_worker:
+                        cancel_message = AgentMessage(
+                            sender=self.name,
+                            recipient=task.assigned_worker,
+                            content={"task_id": task.id},
+                            message_type="task_cancel"
+                        )
+                        
+                        try:
+                            self.protocol.send(cancel_message)
+                        except Exception as e:
+                            logger.warning(f"Failed to send cancel message for task '{task.id}': {str(e)}")
+                    
+                    task.status = TaskStatus.CANCELLED
+            
+            workflow.status = "cancelled"
+            
+            # Move to failed workflows
+            self.failed_workflows[workflow_id] = workflow
+            del self.active_workflows[workflow_id]
+            
+            # Record cancellation in telemetry
+            self.telemetry.record_workflow_cancellation(workflow_id)
+            
+            logger.info(f"Workflow '{workflow_id}' cancelled")
+    
+    def shutdown(self) -> None:
+        """
+        Gracefully shut down the orchestrator.
+        
+        This cancels all active workflows and stops background threads.
+        """
+        logger.info(f"Shutting down orchestrator '{self.name}'")
+        
+        # Stop the monitoring thread
+        self._stop_monitoring.set()
+        if self._monitoring_thread.is_alive():
+            self._monitoring_thread.join(timeout=5)
+        
+        # Cancel all active workflows
+        with self._workflows_lock:
+            for workflow_id in list(self.active_workflows.keys()):
+                try:
+                    self.cancel_workflow(workflow_id)
+                except Exception as e:
+                    logger.error(f"Error cancelling workflow '{workflow_id}' during shutdown: {str(e)}")
+        
+        logger.info(f"Orchestrator '{self.name}' shutdown complete")
