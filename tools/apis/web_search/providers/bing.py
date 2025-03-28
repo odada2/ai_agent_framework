@@ -3,7 +3,7 @@ Bing Search API Provider Implementation
 
 This module provides a robust implementation of the Microsoft Bing Search API with:
 - Support for multiple search types (web, news, images)
-- Response parsing and normalization
+- Comprehensive response parsing and normalization
 - Error handling and rate limiting
 - Result scoring
 """
@@ -15,6 +15,7 @@ import os
 import time
 from typing import Dict, List, Optional, Any, Union, Literal
 from urllib.parse import quote_plus
+from datetime import datetime
 
 import aiohttp
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
@@ -34,6 +35,7 @@ class BingSearchProvider(SearchProvider):
     - Support for multiple search types (web, news, images)
     - API key rotation and management
     - Rate limit handling
+    - Comprehensive result parsing
     - Result scoring
     """
     
@@ -149,6 +151,10 @@ class BingSearchProvider(SearchProvider):
             "Ocp-Apim-Subscription-Key": api_key
         }
         
+        # Retry with client ID if available
+        if client_id := kwargs.get("client_id"):
+            headers["X-MSEdge-ClientID"] = client_id
+        
         try:
             logger.debug(f"Initiating Bing {self.search_type} search: {query}")
             start_time = time.time()
@@ -191,6 +197,23 @@ class BingSearchProvider(SearchProvider):
                     )
                     raise ApiKeyError(f"Invalid API key for Bing Search")
                 
+                # Handle quota exceeded - could come with a 403 status
+                if response.status == 403:
+                    error_text = await response.text()
+                    if "quota" in error_text.lower() or "limit" in error_text.lower():
+                        self.key_manager.report_error(
+                            key=api_key,
+                            is_rate_limit=True,
+                            reset_time=time.time() + 3600  # Default to 1 hour for quota limits
+                        )
+                        raise RateLimitError(
+                            provider="bing",
+                            retry_after=3600
+                        )
+                    else:
+                        self.key_manager.report_error(key=api_key)
+                        raise SearchError(f"API access forbidden: {error_text}")
+                
                 # Handle other errors
                 if response.status != 200:
                     error_text = await response.text()
@@ -201,15 +224,30 @@ class BingSearchProvider(SearchProvider):
                 # Process successful response
                 data = await response.json()
                 
+                # Check for errors in response body (even with 200 status)
+                if "errors" in data or "error" in data:
+                    error_info = data.get("errors", []) or [data.get("error", {})]
+                    error_msg = "; ".join(str(e.get("message", "Unknown error")) for e in error_info)
+                    
+                    # Check for quota or rate limit errors
+                    if any("quota" in str(e).lower() for e in error_info) or any("rate" in str(e).lower() for e in error_info):
+                        self.key_manager.report_error(
+                            key=api_key,
+                            is_rate_limit=True
+                        )
+                        raise RateLimitError(provider="bing", retry_after=3600)
+                    
+                    self.key_manager.report_error(key=api_key)
+                    raise SearchError(f"API error: {error_msg}")
+                
+                # Extract client ID for future requests
+                client_id = response.headers.get("X-MSEdge-ClientID")
+                if client_id:
+                    # Store client ID for future requests
+                    data["_client_id"] = client_id
+                
                 # Report success to key manager
                 self.key_manager.report_success(key=api_key)
-                
-                # Extract quota information if available
-                if "X-MSEdge-ClientID" in response.headers:
-                    client_id = response.headers["X-MSEdge-ClientID"]
-                    if client_id:
-                        # Store client ID for future requests
-                        pass
                 
                 logger.debug(f"Bing search completed in {time.time() - start_time:.2f}s")
                 return data
@@ -252,7 +290,8 @@ class BingSearchProvider(SearchProvider):
                     source="bing",
                     metadata={
                         "display_url": item.get("displayUrl"),
-                        "type": "web"
+                        "type": "web",
+                        "id": item.get("id")
                     }
                 )
                 
@@ -271,39 +310,108 @@ class BingSearchProvider(SearchProvider):
                     metadata={
                         "type": "news",
                         "published": item.get("datePublished"),
-                        "provider": item.get("provider", [{}])[0].get("name", "")
+                        "provider": item.get("provider", [{}])[0].get("name", ""),
+                        "category": item.get("category", ""),
+                        "id": item.get("id")
                     }
                 )
                 
                 # News is time-sensitive, so we boost fresh results
                 result = calculate_score(result, keywords)
                 
+                # Boost score for more recent news
+                if "datePublished" in item:
+                    try:
+                        pub_date = datetime.fromisoformat(item["datePublished"].replace('Z', '+00:00'))
+                        days_old = (datetime.now().replace(tzinfo=None) - pub_date.replace(tzinfo=None)).days
+                        if days_old < 1:
+                            result.score += 0.3  # Today's news
+                        elif days_old < 2:
+                            result.score += 0.2  # Yesterday's news
+                        elif days_old < 7:
+                            result.score += 0.1  # This week's news
+                    except (ValueError, AttributeError):
+                        # Ignore date parsing errors
+                        pass
+                
                 # Add thumbnail if available
-                if "image" in item and "thumbnail" in item["image"]:
-                    result.metadata["image_url"] = item["image"]["thumbnail"].get("contentUrl")
+                if "image" in item:
+                    if "thumbnail" in item["image"]:
+                        result.metadata["image_url"] = item["image"]["thumbnail"].get("contentUrl")
+                    elif "contentUrl" in item["image"]:
+                        result.metadata["image_url"] = item["image"].get("contentUrl")
                 
                 results.append(result)
         
         # Process image search results
         elif self.search_type == "images" and "value" in raw_data:
             for item in raw_data["value"]:
+                # For images, we need both the image URL and hosting page URL
+                image_url = item.get("contentUrl", "")
+                hosting_url = item.get("hostPageUrl", "")
+                
+                # Prefer the hosting URL for primary result.url if available
+                url = hosting_url if hosting_url else image_url
+                
                 result = SearchResult(
                     title=item.get("name", ""),
-                    url=item.get("contentUrl", ""),
+                    url=url,  # Use hosting page URL as primary
                     snippet=item.get("name", ""),  # Images don't have snippets, use name
                     source="bing",
                     metadata={
                         "type": "image",
+                        "image_url": image_url,  # Actual image URL
                         "thumbnail_url": item.get("thumbnailUrl"),
                         "width": item.get("width"),
                         "height": item.get("height"),
                         "content_size": item.get("contentSize"),
-                        "media_source": item.get("hostPageDisplayUrl")
+                        "media_source": item.get("hostPageDisplayUrl"),
+                        "encoding_format": item.get("encodingFormat", ""),
+                        "accentColor": item.get("accentColor")
                     }
                 )
                 
+                # Score with emphasis on image specifics
                 result = calculate_score(result, keywords)
+                
+                # Boost high-resolution images
+                if item.get("width", 0) > 1000 and item.get("height", 0) > 1000:
+                    result.score += 0.1
+                
                 results.append(result)
+                
+        # Process related searches (can be present in any search type)
+        if "relatedSearches" in raw_data and raw_data["relatedSearches"].get("value"):
+            # Add some related searches as results with lower scores
+            for item in raw_data["relatedSearches"].get("value", [])[:2]:  # Limit to 2 related searches
+                related_query = item.get("text", "")
+                url = item.get("webSearchUrl", "")
+                
+                if related_query and url:
+                    result = SearchResult(
+                        title=f"Related: {related_query}",
+                        url=url,
+                        snippet=f"Related search: {related_query}",
+                        source="bing",
+                        metadata={
+                            "type": "related_search",
+                            "original_query": query
+                        }
+                    )
+                    
+                    # Lower score for related searches
+                    result.score = 0.3
+                    results.append(result)
+                    
+        # Handle empty results with helpful metadata
+        if not results:
+            # Check if we have specific info on why no results were found
+            if "rankingResponse" in raw_data:
+                ranking = raw_data["rankingResponse"]
+                if "mainline" in ranking and not ranking["mainline"].get("items", []):
+                    logger.info(f"No results found for query: {query}")
+            
+            logger.debug(f"No parseable results for query: {query}")
         
         # Sort by score (descending)
         return sorted(results, key=lambda x: x.score, reverse=True)

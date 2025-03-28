@@ -1,433 +1,459 @@
 """
-API Key Management for Web Search Providers
+Bing Search API Provider Implementation
 
-This module provides a robust system for managing API keys with:
-- Key rotation to prevent rate limiting issues
-- Health tracking for keys
-- Support for multiple keys per provider
-- Automatic fallback if a key becomes invalid or rate limited
+This module provides a robust implementation of the Microsoft Bing Search API with:
+- Support for multiple search types (web, news, images)
+- Comprehensive response parsing and normalization
+- Error handling and rate limiting
+- Result scoring
 """
 
+import asyncio
+import json
 import logging
 import os
 import time
-import json
-import random
-from typing import Dict, List, Optional, Any, Set, Tuple
-from dataclasses import dataclass, asdict, field
-from datetime import datetime, timedelta
-from pathlib import Path
+from typing import Dict, List, Optional, Any, Union, Literal
+from urllib.parse import quote_plus
+from datetime import datetime
 
-from filelock import FileLock
+import aiohttp
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 
-from ...core.tools.base import ApiKeyError
+from ..base import SearchProvider, SearchResult, RateLimitError, ApiKeyError, SearchError
+from ..api_key_manager import ApiKeyManager
+from ..utils import calculate_score
 
 logger = logging.getLogger(__name__)
 
 
-@dataclass
-class ApiKeyStatus:
-    """Status tracking for an individual API key"""
-    key: str  # The API key (may be partially masked for logging)
-    provider: str  # The provider this key is for
-    is_valid: bool = True  # Whether the key is currently valid
-    is_active: bool = True  # Whether the key is currently in rotation
-    error_count: int = 0  # Number of consecutive errors
-    last_used: Optional[float] = None  # Last time the key was used (timestamp)
-    rate_limit_reset: Optional[float] = None  # When rate limit resets (timestamp)
-    calls_remaining: Optional[int] = None  # Rate limit info if available
-    total_calls: int = 0  # Total number of calls made with this key
-    daily_calls: int = 0  # Calls made today
-    last_reset_day: Optional[str] = None  # Last day the daily counter was reset (YYYY-MM-DD)
-    
-    def update_usage(self) -> None:
-        """Update usage statistics when key is used"""
-        now = time.time()
-        today = datetime.now().strftime("%Y-%m-%d")
-        
-        self.last_used = now
-        self.total_calls += 1
-        
-        # Reset daily counter if day changed
-        if self.last_reset_day != today:
-            self.daily_calls = 1
-            self.last_reset_day = today
-        else:
-            self.daily_calls += 1
-    
-    def mark_error(self, is_rate_limit: bool = False, reset_time: Optional[float] = None) -> None:
-        """
-        Mark an error for this key.
-        
-        Args:
-            is_rate_limit: Whether this is a rate limit error
-            reset_time: When the rate limit resets (if applicable)
-        """
-        self.error_count += 1
-        
-        if is_rate_limit:
-            self.rate_limit_reset = reset_time or (time.time() + 60)  # Default 1 minute if unknown
-            self.calls_remaining = 0
-        
-        # Deactivate key if too many errors
-        if self.error_count >= 5:
-            self.is_active = False
-    
-    def reset_errors(self) -> None:
-        """Reset error count after successful use"""
-        self.error_count = 0
-    
-    def is_rate_limited(self) -> bool:
-        """Check if key is currently rate limited"""
-        if not self.rate_limit_reset:
-            return False
-        return time.time() < self.rate_limit_reset
-    
-    def time_to_reset(self) -> Optional[int]:
-        """Get seconds until rate limit reset"""
-        if not self.rate_limit_reset:
-            return None
-        return max(0, int(self.rate_limit_reset - time.time()))
-    
-    def to_dict(self) -> Dict[str, Any]:
-        """Convert to dictionary for serialization"""
-        return asdict(self)
-    
-    @classmethod
-    def from_dict(cls, data: Dict[str, Any]) -> 'ApiKeyStatus':
-        """Create from dictionary"""
-        return cls(**data)
-    
-    def get_masked_key(self) -> str:
-        """Get a masked version of the key for logging"""
-        if not self.key or len(self.key) < 8:
-            return "***"
-        return f"{self.key[:4]}...{self.key[-4:]}"
-
-
-class ApiKeyManager:
+class BingSearchProvider(SearchProvider):
     """
-    Manager for API keys with rotation and health tracking.
+    Bing Web Search API provider implementation.
     
     Features:
-    - Key rotation based on usage and health
-    - Persistent storage of key status
-    - Rate limit awareness
-    - Automatic fallback to backup keys
+    - Support for multiple search types (web, news, images)
+    - API key rotation and management
+    - Rate limit handling
+    - Comprehensive result parsing
+    - Result scoring
     """
+    
+    # API endpoints for different search types
+    ENDPOINTS = {
+        "web": "https://api.bing.microsoft.com/v7.0/search",
+        "news": "https://api.bing.microsoft.com/v7.0/news/search",
+        "images": "https://api.bing.microsoft.com/v7.0/images/search"
+    }
     
     def __init__(
         self,
-        provider: str,
-        keys: Optional[List[str]] = None,
-        state_file: Optional[str] = None,
-        auto_rotate: bool = True
+        api_keys: Optional[List[str]] = None,
+        search_type: Literal["web", "news", "images"] = "web",
+        timeout: int = 10
     ):
         """
-        Initialize the API key manager.
+        Initialize the Bing Search provider.
         
         Args:
-            provider: Name of the provider (e.g., 'serper', 'google')
-            keys: List of API keys (will also check environment variables if not provided)
-            state_file: Path to state file for persistent storage
-            auto_rotate: Whether to automatically rotate keys
+            api_keys: List of API keys (will check environment variables if not provided)
+            search_type: Type of search to perform
+            timeout: Request timeout in seconds
         """
-        self.provider = provider
-        self.auto_rotate = auto_rotate
-        self.state_file = state_file or self._get_default_state_file()
+        self.timeout = timeout
+        self.search_type = search_type
         
-        # Initialize key status tracking
-        self.keys: Dict[str, ApiKeyStatus] = {}
-        self.active_keys: Set[str] = set()
-        self.current_key: Optional[str] = None
+        if search_type not in self.ENDPOINTS:
+            logger.warning(f"Invalid search type '{search_type}'. Defaulting to 'web'.")
+            self.search_type = "web"
+            
+        self.base_url = self.ENDPOINTS[self.search_type]
+        self.session = None
         
-        # Load keys
-        self._load_keys(keys)
-        
-        # Load state if available
-        self._load_state()
-        
-        # Set initial current key
-        self._select_current_key()
+        # Initialize API key manager
+        self.key_manager = ApiKeyManager(
+            provider="bing",
+            keys=api_keys,
+            auto_rotate=True
+        )
     
-    def _get_default_state_file(self) -> str:
-        """Get default state file path based on provider"""
-        state_dir = os.environ.get("API_KEY_STATE_DIR", "./.api_key_state")
-        os.makedirs(state_dir, exist_ok=True)
-        return f"{state_dir}/{self.provider}_key_state.json"
-    
-    def _load_keys(self, keys: Optional[List[str]]) -> None:
+    async def _get_session(self) -> aiohttp.ClientSession:
         """
-        Load API keys from the provided list and environment variables.
-        
-        Args:
-            keys: Optional explicit list of keys
-        """
-        loaded_keys = set()
-        
-        # Load from provided keys
-        if keys:
-            for key in keys:
-                if key and key.strip():
-                    loaded_keys.add(key.strip())
-        
-        # Load from environment variables
-        self._load_keys_from_env(loaded_keys)
-        
-        # Initialize key status for all keys
-        for key in loaded_keys:
-            self.keys[key] = ApiKeyStatus(key=key, provider=self.provider)
-            self.active_keys.add(key)
-        
-        logger.info(f"Loaded {len(self.keys)} API keys for {self.provider}")
-        
-        if not self.keys:
-            logger.warning(f"No API keys found for {self.provider}")
-    
-    def _load_keys_from_env(self, loaded_keys: Set[str]) -> None:
-        """
-        Load API keys from environment variables.
-        
-        Args:
-            loaded_keys: Set to add discovered keys to
-        """
-        # Check provider-specific single key env var
-        env_var_name = f"{self.provider.upper()}_API_KEY"
-        if key := os.environ.get(env_var_name):
-            loaded_keys.add(key.strip())
-        
-        # Check general API key env var with provider prefix
-        env_var_name = f"API_KEY_{self.provider.upper()}"
-        if key := os.environ.get(env_var_name):
-            loaded_keys.add(key.strip())
-        
-        # Check for numbered keys for rotation
-        for i in range(1, 10):  # Check up to 9 numbered keys
-            env_var_name = f"{self.provider.upper()}_API_KEY_{i}"
-            if key := os.environ.get(env_var_name):
-                loaded_keys.add(key.strip())
-    
-    def _load_state(self) -> None:
-        """Load key state from state file if available"""
-        if not self.state_file or not Path(self.state_file).exists():
-            return
-        
-        try:
-            with FileLock(f"{self.state_file}.lock"):
-                with open(self.state_file, 'r') as f:
-                    state_data = json.load(f)
-                
-                # Process each key
-                for key_data in state_data.get('keys', []):
-                    key = key_data.get('key')
-                    if key in self.keys:
-                        # Update existing key status
-                        self.keys[key] = ApiKeyStatus.from_dict(key_data)
-                        
-                        # Update active keys set
-                        if self.keys[key].is_active:
-                            self.active_keys.add(key)
-                        else:
-                            self.active_keys.discard(key)
-        except (json.JSONDecodeError, OSError) as e:
-            logger.error(f"Error loading API key state: {str(e)}")
-    
-    def _save_state(self) -> None:
-        """Save current key state to state file"""
-        if not self.state_file:
-            return
-        
-        try:
-            state_dir = os.path.dirname(self.state_file)
-            if state_dir:
-                os.makedirs(state_dir, exist_ok=True)
-                
-            with FileLock(f"{self.state_file}.lock"):
-                state_data = {
-                    'provider': self.provider,
-                    'updated_at': datetime.now().isoformat(),
-                    'keys': [key_status.to_dict() for key_status in self.keys.values()]
-                }
-                
-                with open(self.state_file, 'w') as f:
-                    json.dump(state_data, f, indent=2)
-        except OSError as e:
-            logger.error(f"Error saving API key state: {str(e)}")
-    
-    def _select_current_key(self) -> Optional[str]:
-        """
-        Select the best key to use based on health and usage.
+        Get or create an aiohttp session.
         
         Returns:
-            Selected API key or None if no keys available
+            aiohttp ClientSession
         """
-        if not self.active_keys:
-            self.current_key = None
-            return None
-        
-        # Get candidate keys (not rate limited)
-        candidates = [k for k in self.active_keys if not self.keys[k].is_rate_limited()]
-        
-        if not candidates:
-            # If all keys are rate limited, find the one that will reset soonest
-            min_reset_time = float('inf')
-            soonest_key = None
-            
-            for key in self.active_keys:
-                reset_time = self.keys[key].time_to_reset()
-                if reset_time is not None and reset_time < min_reset_time:
-                    min_reset_time = reset_time
-                    soonest_key = key
-            
-            self.current_key = soonest_key
-            return soonest_key
-        
-        # Select key with fewest daily calls
-        candidates.sort(key=lambda k: self.keys[k].daily_calls)
-        self.current_key = candidates[0]
-        return self.current_key
+        if self.session is None or self.session.closed:
+            timeout = aiohttp.ClientTimeout(total=self.timeout)
+            self.session = aiohttp.ClientSession(timeout=timeout)
+        return self.session
     
-    def get_key(self) -> str:
+    @retry(
+        retry=retry_if_exception_type((aiohttp.ClientError, asyncio.TimeoutError)),
+        stop=stop_after_attempt(3),
+        wait=wait_exponential(multiplier=1, min=4, max=10)
+    )
+    async def search(self, query: str, num_results: int = 5, **kwargs) -> Dict[str, Any]:
         """
-        Get the current API key to use.
+        Execute a search using the Bing Search API.
         
+        Args:
+            query: Search query
+            num_results: Number of results to request (1-50)
+            **kwargs: Additional parameters:
+                - mkt: Market code (e.g., 'en-US')
+                - safe_search: Safe search level ('off', 'moderate', 'strict')
+                - freshness: Time period ('day', 'week', 'month')
+                - site_restrict: Restrict to specific site
+                
         Returns:
-            Current API key
+            Raw API response
             
         Raises:
-            ApiKeyError: If no valid keys are available
+            RateLimitError: When rate limit is exceeded
+            ApiKeyError: When API key is invalid
+            SearchError: For other search-related errors
         """
-        if not self.keys:
-            raise ApiKeyError(f"No API keys configured for {self.provider}")
+        session = await self._get_session()
         
-        if not self.active_keys:
-            raise ApiKeyError(f"All API keys for {self.provider} are invalid or deactivated")
+        # Get an API key
+        try:
+            api_key = self.key_manager.get_key()
+        except ApiKeyError as e:
+            logger.error(f"API key error: {str(e)}")
+            raise
         
-        # Check if current key needs rotation
-        if self.auto_rotate and self.current_key:
-            status = self.keys[self.current_key]
+        # Build URL parameters
+        params = {
+            "q": query,
+            "count": min(num_results, 50)  # Bing allows up to 50 results per request
+        }
+        
+        # Add site restriction if specified
+        if site_restrict := kwargs.get("site_restrict"):
+            params["q"] = f"{params['q']} site:{site_restrict}"
+        
+        # Add market parameter
+        if mkt := kwargs.get("mkt"):
+            params["mkt"] = mkt
+        
+        # Add safe search parameter
+        if safe_search := kwargs.get("safe_search"):
+            params["safeSearch"] = safe_search
+        
+        # Add freshness parameter
+        if freshness := kwargs.get("freshness"):
+            params["freshness"] = freshness
+        
+        # Add proper headers for Bing API
+        headers = {
+            "Ocp-Apim-Subscription-Key": api_key
+        }
+        
+        # Retry with client ID if available
+        if client_id := kwargs.get("client_id"):
+            headers["X-MSEdge-ClientID"] = client_id
+        
+        try:
+            logger.debug(f"Initiating Bing {self.search_type} search: {query}")
+            start_time = time.time()
             
-            if status.is_rate_limited() or not status.is_active:
-                self._select_current_key()
-        
-        # If no current key, select one
-        if not self.current_key:
-            self._select_current_key()
-        
-        # If still no key, all are rate limited
-        if not self.current_key:
-            min_wait = min(
-                self.keys[k].time_to_reset() or 60 
-                for k in self.active_keys
-            )
-            raise ApiKeyError(
-                f"All API keys for {self.provider} are rate limited. "
-                f"Try again in {min_wait} seconds."
-            )
-        
-        # Update usage statistics
-        self.keys[self.current_key].update_usage()
-        self._save_state()
-        
-        return self.current_key
-    
-    def report_success(self, key: Optional[str] = None, calls_remaining: Optional[int] = None) -> None:
-        """
-        Report successful API call for a key.
-        
-        Args:
-            key: The key that was used (defaults to current key)
-            calls_remaining: Optional rate limit information
-        """
-        key = key or self.current_key
-        if not key or key not in self.keys:
-            return
-        
-        status = self.keys[key]
-        status.reset_errors()
-        
-        if calls_remaining is not None:
-            status.calls_remaining = calls_remaining
-        
-        self._save_state()
-    
-    def report_error(
-        self,
-        key: Optional[str] = None,
-        is_rate_limit: bool = False,
-        reset_time: Optional[float] = None,
-        is_authentication_error: bool = False
-    ) -> None:
-        """
-        Report an error with an API key.
-        
-        Args:
-            key: The key that had an error (defaults to current key)
-            is_rate_limit: Whether this was a rate limit error
-            reset_time: When the rate limit resets (if known)
-            is_authentication_error: Whether this was an authentication error
-        """
-        key = key or self.current_key
-        if not key or key not in self.keys:
-            return
-        
-        status = self.keys[key]
-        
-        # Handle authentication errors (invalid key)
-        if is_authentication_error:
-            status.is_valid = False
-            status.is_active = False
-            self.active_keys.discard(key)
-            logger.warning(f"API key {status.get_masked_key()} for {self.provider} is invalid")
-        
-        # Handle rate limit errors
-        elif is_rate_limit:
-            status.mark_error(is_rate_limit=True, reset_time=reset_time)
-            logger.info(
-                f"API key {status.get_masked_key()} for {self.provider} hit rate limit. "
-                f"Will reset in {status.time_to_reset()} seconds."
-            )
-        
-        # Handle other errors
-        else:
-            status.mark_error()
+            async with session.get(
+                self.base_url,
+                params=params,
+                headers=headers
+            ) as response:
+                # Handle rate limit response
+                if response.status == 429:
+                    # Get rate limit headers
+                    retry_after = response.headers.get("Retry-After")
+                    reset_time = None
+                    
+                    if retry_after:
+                        try:
+                            reset_time = time.time() + int(retry_after)
+                        except ValueError:
+                            reset_time = time.time() + 60  # Default: 1 minute
+                    
+                    # Report rate limit error to key manager
+                    self.key_manager.report_error(
+                        key=api_key,
+                        is_rate_limit=True,
+                        reset_time=reset_time
+                    )
+                    
+                    retry_after_seconds = int(reset_time - time.time()) if reset_time else 60
+                    raise RateLimitError(
+                        provider="bing",
+                        retry_after=retry_after_seconds
+                    )
+                
+                # Handle authentication error
+                if response.status == 401:
+                    self.key_manager.report_error(
+                        key=api_key,
+                        is_authentication_error=True
+                    )
+                    raise ApiKeyError(f"Invalid API key for Bing Search")
+                
+                # Handle quota exceeded - could come with a 403 status
+                if response.status == 403:
+                    error_text = await response.text()
+                    if "quota" in error_text.lower() or "limit" in error_text.lower():
+                        self.key_manager.report_error(
+                            key=api_key,
+                            is_rate_limit=True,
+                            reset_time=time.time() + 3600  # Default to 1 hour for quota limits
+                        )
+                        raise RateLimitError(
+                            provider="bing",
+                            retry_after=3600
+                        )
+                    else:
+                        self.key_manager.report_error(key=api_key)
+                        raise SearchError(f"API access forbidden: {error_text}")
+                
+                # Handle other errors
+                if response.status != 200:
+                    error_text = await response.text()
+                    self.key_manager.report_error(key=api_key)
+                    logger.error(f"Bing Search API error: {response.status} - {error_text}")
+                    raise SearchError(f"API request failed: {error_text}")
+                
+                # Process successful response
+                data = await response.json()
+                
+                # Check for errors in response body (even with 200 status)
+                if "errors" in data or "error" in data:
+                    error_info = data.get("errors", []) or [data.get("error", {})]
+                    error_msg = "; ".join(str(e.get("message", "Unknown error")) for e in error_info)
+                    
+                    # Check for quota or rate limit errors
+                    if any("quota" in str(e).lower() for e in error_info) or any("rate" in str(e).lower() for e in error_info):
+                        self.key_manager.report_error(
+                            key=api_key,
+                            is_rate_limit=True
+                        )
+                        raise RateLimitError(provider="bing", retry_after=3600)
+                    
+                    self.key_manager.report_error(key=api_key)
+                    raise SearchError(f"API error: {error_msg}")
+                
+                # Extract client ID for future requests
+                client_id = response.headers.get("X-MSEdge-ClientID")
+                if client_id:
+                    # Store client ID for future requests
+                    data["_client_id"] = client_id
+                
+                # Report success to key manager
+                self.key_manager.report_success(key=api_key)
+                
+                logger.debug(f"Bing search completed in {time.time() - start_time:.2f}s")
+                return data
+                
+        except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+            # Network-related errors
+            self.key_manager.report_error(key=api_key)
+            logger.error(f"Bing search request error: {str(e)}")
+            raise SearchError(f"Request failed: {str(e)}")
             
-            # Deactivate key if too many errors
-            if not status.is_active:
-                self.active_keys.discard(key)
-                logger.warning(
-                    f"API key {status.get_masked_key()} for {self.provider} deactivated "
-                    f"due to {status.error_count} consecutive errors"
-                )
-        
-        # Select a new key if current key had an error
-        if key == self.current_key and (is_rate_limit or not status.is_active):
-            self.current_key = None
-            self._select_current_key()
-        
-        self._save_state()
-    
-    def reactivate_key(self, key: str) -> bool:
+        except Exception as e:
+            # Unexpected errors
+            if not isinstance(e, (RateLimitError, ApiKeyError, SearchError)):
+                self.key_manager.report_error(key=api_key)
+                logger.error(f"Bing search error: {str(e)}")
+                raise SearchError(f"Search failed: {str(e)}")
+            raise
+
+    def parse_results(self, raw_data: Dict[str, Any], query: str) -> List[SearchResult]:
         """
-        Attempt to reactivate a deactivated key.
+        Parse Bing search results into standardized SearchResult objects.
         
         Args:
-            key: The key to reactivate
+            raw_data: Raw API response
+            query: Original search query
             
         Returns:
-            True if key was reactivated, False otherwise
+            List of SearchResult objects
         """
-        if key not in self.keys:
-            return False
+        results = []
+        keywords = [w.lower() for w in query.split() if len(w) > 3]
         
-        status = self.keys[key]
+        # Process web search results
+        if self.search_type == "web" and "webPages" in raw_data:
+            for item in raw_data["webPages"].get("value", []):
+                result = SearchResult(
+                    title=item.get("name", ""),
+                    url=item.get("url", ""),
+                    snippet=item.get("snippet", ""),
+                    source="bing",
+                    metadata={
+                        "display_url": item.get("displayUrl"),
+                        "type": "web",
+                        "id": item.get("id")
+                    }
+                )
+                
+                # Score and add result
+                result = calculate_score(result, keywords)
+                results.append(result)
         
-        # Only reactivate if key is valid but inactive
-        if status.is_valid and not status.is_active:
-            status.is_active = True
-            status.error_count = 0
-            self.active_keys.add(key)
+        # Process news search results
+        elif self.search_type == "news" and "value" in raw_data:
+            for item in raw_data["value"]:
+                result = SearchResult(
+                    title=item.get("name", ""),
+                    url=item.get("url", ""),
+                    snippet=item.get("description", ""),
+                    source="bing",
+                    metadata={
+                        "type": "news",
+                        "published": item.get("datePublished"),
+                        "provider": item.get("provider", [{}])[0].get("name", ""),
+                        "category": item.get("category", ""),
+                        "id": item.get("id")
+                    }
+                )
+                
+                # News is time-sensitive, so we boost fresh results
+                result = calculate_score(result, keywords)
+                
+                # Boost score for more recent news
+                if "datePublished" in item:
+                    try:
+                        pub_date = datetime.fromisoformat(item["datePublished"].replace('Z', '+00:00'))
+                        days_old = (datetime.now().replace(tzinfo=None) - pub_date.replace(tzinfo=None)).days
+                        if days_old < 1:
+                            result.score += 0.3  # Today's news
+                        elif days_old < 2:
+                            result.score += 0.2  # Yesterday's news
+                        elif days_old < 7:
+                            result.score += 0.1  # This week's news
+                    except (ValueError, AttributeError):
+                        # Ignore date parsing errors
+                        pass
+                
+                # Add thumbnail if available
+                if "image" in item:
+                    if "thumbnail" in item["image"]:
+                        result.metadata["image_url"] = item["image"]["thumbnail"].get("contentUrl")
+                    elif "contentUrl" in item["image"]:
+                        result.metadata["image_url"] = item["image"].get("contentUrl")
+                
+                results.append(result)
+        
+        # Process image search results
+        elif self.search_type == "images" and "value" in raw_data:
+            for item in raw_data["value"]:
+                # For images, we need both the image URL and hosting page URL
+                image_url = item.get("contentUrl", "")
+                hosting_url = item.get("hostPageUrl", "")
+                
+                # Prefer the hosting URL for primary result.url if available
+                url = hosting_url if hosting_url else image_url
+                
+                result = SearchResult(
+                    title=item.get("name", ""),
+                    url=url,  # Use hosting page URL as primary
+                    snippet=item.get("name", ""),  # Images don't have snippets, use name
+                    source="bing",
+                    metadata={
+                        "type": "image",
+                        "image_url": image_url,  # Actual image URL
+                        "thumbnail_url": item.get("thumbnailUrl"),
+                        "width": item.get("width"),
+                        "height": item.get("height"),
+                        "content_size": item.get("contentSize"),
+                        "media_source": item.get("hostPageDisplayUrl"),
+                        "encoding_format": item.get("encodingFormat", ""),
+                        "accentColor": item.get("accentColor")
+                    }
+                )
+                
+                # Score with emphasis on image specifics
+                result = calculate_score(result, keywords)
+                
+                # Boost high-resolution images
+                if item.get("width", 0) > 1000 and item.get("height", 0) > 1000:
+                    result.score += 0.1
+                
+                results.append(result)
+                
+        # Process related searches (can be present in any search type)
+        if "relatedSearches" in raw_data and raw_data["relatedSearches"].get("value"):
+            # Add some related searches as results with lower scores
+            for item in raw_data["relatedSearches"].get("value", [])[:2]:  # Limit to 2 related searches
+                related_query = item.get("text", "")
+                url = item.get("webSearchUrl", "")
+                
+                if related_query and url:
+                    result = SearchResult(
+                        title=f"Related: {related_query}",
+                        url=url,
+                        snippet=f"Related search: {related_query}",
+                        source="bing",
+                        metadata={
+                            "type": "related_search",
+                            "original_query": query
+                        }
+                    )
+                    
+                    # Lower score for related searches
+                    result.score = 0.3
+                    results.append(result)
+                    
+        # Handle empty results with helpful metadata
+        if not results:
+            # Check if we have specific info on why no results were found
+            if "rankingResponse" in raw_data:
+                ranking = raw_data["rankingResponse"]
+                if "mainline" in ranking and not ranking["mainline"].get("items", []):
+                    logger.info(f"No results found for query: {query}")
             
-            logger.info(f"Reactivated API key {status.get_masked_key()} for {self.provider}")
-            self._save_state()
-            return
+            logger.debug(f"No parseable results for query: {query}")
+        
+        # Sort by score (descending)
+        return sorted(results, key=lambda x: x.score, reverse=True)
+    
+    async def check_status(self) -> Dict[str, Any]:
+        """
+        Check the status of the Bing search provider.
+        
+        Returns:
+            Status information
+        """
+        status = {
+            "provider": "bing",
+            "search_type": self.search_type,
+            "operational": False,
+            "active_keys": 0,
+            "total_keys": 0
+        }
+        
+        # Check if we have any keys
+        if not hasattr(self.key_manager, 'keys') or not self.key_manager.keys:
+            status["error"] = "No API keys configured"
+            return status
+        
+        # Get key statistics
+        status["total_keys"] = len(self.key_manager.keys)
+        status["active_keys"] = len(self.key_manager.active_keys)
+        
+        if status["active_keys"] == 0:
+            status["error"] = "No active API keys"
+            return status
+        
+        # Test with a simple query
+        try:
+            await self.search("test query", num_results=1)
+            status["operational"] = True
+        except Exception as e:
+            status["error"] = str(e)
+        
+        return status
+    
+    async def close(self):
+        """Clean up resources"""
+        if self.session and not self.session.closed:
+            await self.session.close()

@@ -1,19 +1,20 @@
 """
 Utility Functions for Web Search
 
-This module provides utility functions for:
+This module provides utility functions for the web search implementation, including:
 - Query sanitization
 - Result scoring
 - Domain validation
+- URL processing
 - Rate limit handling
 """
 
 import re
 import logging
 import time
-from datetime import datetime, timedelta
+from datetime import datetime
 from typing import Dict, List, Optional, Any, Set, Union
-from urllib.parse import quote_plus, urlparse
+from urllib.parse import quote_plus, urlparse, parse_qs
 
 from .base import SearchResult
 
@@ -55,7 +56,7 @@ def is_valid_domain(domain: str) -> bool:
     Returns:
         True if valid, False otherwise
     """
-    # Basic domain validation pattern
+    # Empty domain is invalid
     if not domain:
         return False
     
@@ -152,9 +153,60 @@ def calculate_score(result: SearchResult, query_keywords: Optional[List[str]] = 
     if re.search(r'(sess|tmp|temp|session|cache)[=_-]', url_lower):
         score -= 0.1
         
+    # Freshness boost for recent content if date is available in metadata
+    if 'published' in result.metadata:
+        pub_date_str = result.metadata['published']
+        try:
+            if isinstance(pub_date_str, str):
+                # Handle different date formats
+                for fmt in ('%Y-%m-%dT%H:%M:%S', '%Y-%m-%d %H:%M:%S', '%Y-%m-%d'):
+                    try:
+                        pub_date = datetime.strptime(pub_date_str[:19], fmt)  # Truncate to avoid timezone issues
+                        break
+                    except ValueError:
+                        continue
+                else:
+                    # If no format worked, try ISO format with various timezone handling
+                    pub_date = datetime.fromisoformat(pub_date_str.replace('Z', '+00:00'))
+                
+                # Calculate days since publication
+                days_old = (datetime.now() - pub_date).days
+                if days_old < 1:
+                    score += 0.3  # Today
+                elif days_old < 7:
+                    score += 0.2  # Within a week
+                elif days_old < 30:
+                    score += 0.1  # Within a month
+                elif days_old > 365:
+                    score -= 0.1  # Older than a year
+        except (ValueError, TypeError):
+            # Ignore date parsing errors
+            pass
+        
     # Cap score between 0 and 1
     result.score = max(0.0, min(1.0, score))
     return result
+
+
+def extract_query_parameters(url: str) -> Dict[str, str]:
+    """
+    Extract query parameters from a URL.
+    
+    Args:
+        url: URL to extract from
+        
+    Returns:
+        Dictionary of query parameters
+    """
+    try:
+        parsed = urlparse(url)
+        query_params = parse_qs(parsed.query)
+        
+        # Convert lists to single values
+        return {k: v[0] if v else '' for k, v in query_params.items()}
+    except Exception as e:
+        logger.warning(f"Error extracting query parameters: {str(e)}")
+        return {}
 
 
 def format_search_results(results: List[SearchResult], query: str, highlight: bool = False) -> str:
@@ -185,11 +237,19 @@ def format_search_results(results: List[SearchResult], query: str, highlight: bo
             for kw in keywords:
                 # Bold keywords in title and snippet
                 if kw in title.lower():
-                    pattern = re.compile(re.escape(kw), re.IGNORECASE)
-                    title = pattern.sub(f"**{pattern.group(0)}**", title)
+                    title = re.sub(
+                        rf'\b{re.escape(kw)}\b', 
+                        lambda m: f"**{m.group(0)}**", 
+                        title, 
+                        flags=re.IGNORECASE
+                    )
                 if kw in snippet.lower():
-                    pattern = re.compile(re.escape(kw), re.IGNORECASE)
-                    snippet = pattern.sub(f"**{pattern.group(0)}**", snippet)
+                    snippet = re.sub(
+                        rf'\b{re.escape(kw)}\b', 
+                        lambda m: f"**{m.group(0)}**", 
+                        snippet, 
+                        flags=re.IGNORECASE
+                    )
         
         # Add result to output
         lines.extend([
@@ -198,6 +258,10 @@ def format_search_results(results: List[SearchResult], query: str, highlight: bo
             f"   {snippet}",
             f"   Source: {result.source.capitalize()}"
         ])
+        
+        # Add metadata type if available
+        if "type" in result.metadata:
+            lines.append(f"   Type: {result.metadata['type'].replace('_', ' ').title()}")
     
     return "\n".join(lines)
 
@@ -261,3 +325,82 @@ def get_url_with_params(base_url: str, params: Dict[str, Any]) -> str:
             return f"{base_url}?{query_string}"
     
     return base_url
+
+
+def truncate_text(text: str, max_length: int = 200, append_ellipsis: bool = True) -> str:
+    """
+    Truncate text to a maximum length, optionally appending an ellipsis.
+    
+    Args:
+        text: Text to truncate
+        max_length: Maximum length
+        append_ellipsis: Whether to append an ellipsis
+        
+    Returns:
+        Truncated text
+    """
+    if not text or len(text) <= max_length:
+        return text
+    
+    # Try to truncate at a word boundary
+    truncated = text[:max_length]
+    last_space = truncated.rfind(' ')
+    
+    if last_space > max_length * 0.8:  # Only if space is reasonably far in
+        truncated = truncated[:last_space]
+    
+    if append_ellipsis:
+        truncated += "..."
+    
+    return truncated
+
+
+def normalize_url(url: str) -> str:
+    """
+    Normalize a URL by removing common tracking parameters and fragments.
+    
+    Args:
+        url: URL to normalize
+        
+    Returns:
+        Normalized URL
+    """
+    try:
+        # Parse the URL
+        parsed = urlparse(url)
+        
+        # Remove common tracking parameters
+        if parsed.query:
+            query_dict = parse_qs(parsed.query)
+            # List of tracking parameters to remove
+            tracking_params = {
+                'utm_source', 'utm_medium', 'utm_campaign', 'utm_term', 'utm_content',
+                'fbclid', 'gclid', 'ocid', 'msclkid', 'zanpid', 'dclid', '_hsenc', '_hsmi'
+            }
+            
+            # Filter out tracking parameters
+            filtered_query = {k: v for k, v in query_dict.items() if k.lower() not in tracking_params}
+            
+            # Rebuild query string
+            if filtered_query:
+                query_string = '&'.join(f"{k}={v[0]}" for k, v in filtered_query.items())
+            else:
+                query_string = ''
+        else:
+            query_string = ''
+        
+        # Remove fragment (hash) if present
+        fragment = ''
+        
+        # Rebuild the URL
+        normalized = parsed._replace(query=query_string, fragment=fragment).geturl()
+        
+        # Ensure URL has a protocol
+        if not normalized.startswith(('http://', 'https://')):
+            normalized = 'https://' + normalized
+        
+        return normalized
+        
+    except Exception as e:
+        logger.warning(f"Error normalizing URL: {str(e)}")
+        return url
