@@ -2,10 +2,11 @@
 Serper.dev Search Provider Implementation
 
 This module provides a robust implementation of the Serper.dev search API with:
-- Proper rate limit handling
-- Response parsing
-- Error handling
-- Result scoring
+- Proper rate limit handling and detection
+- Comprehensive response parsing for multiple result types
+- Advanced error handling
+- Result scoring and normalization
+- API key rotation and management
 """
 
 import asyncio
@@ -18,9 +19,9 @@ from typing import Dict, List, Optional, Any, Union
 import aiohttp
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 
-from ..base import SearchProvider, SearchResult, RateLimitError, ApiKeyError
+from ..base import SearchProvider, SearchResult, RateLimitError, ApiKeyError, SearchError
 from ..api_key_manager import ApiKeyManager
-from ..utils import calculate_score
+from ..utils import calculate_score, extract_domain
 
 logger = logging.getLogger(__name__)
 
@@ -30,10 +31,11 @@ class SerperProvider(SearchProvider):
     Serper.dev search provider implementation.
     
     Features:
-    - API key rotation
+    - API key rotation and management
     - Rate limit handling
-    - Result scoring and normalization
+    - Result scoring and normalization for different result types
     - Structured error handling
+    - Support for different search types (web, news, images)
     """
     
     def __init__(
@@ -58,6 +60,7 @@ class SerperProvider(SearchProvider):
         self.key_manager = ApiKeyManager(
             provider="serper",
             keys=api_keys,
+            env_var="SERPER_API_KEY",
             auto_rotate=True
         )
     
@@ -88,6 +91,7 @@ class SerperProvider(SearchProvider):
             **kwargs: Additional parameters:
                 - gl: Country code (e.g., 'us')
                 - hl: Language code (e.g., 'en')
+                - search_type: Type of search ('search', 'news', 'images')
                 
         Returns:
             Raw API response
@@ -105,6 +109,19 @@ class SerperProvider(SearchProvider):
         except ApiKeyError as e:
             logger.error(f"API key error: {str(e)}")
             raise
+        
+        # Check for search type
+        search_type = kwargs.get("search_type", "search")
+        if search_type not in ["search", "news", "images"]:
+            logger.warning(f"Invalid search type: {search_type}, defaulting to 'search'")
+            search_type = "search"
+        
+        # Update base URL based on search type
+        endpoint = self.base_url
+        if search_type == "news":
+            endpoint = endpoint.replace("/search", "/news")
+        elif search_type == "images":
+            endpoint = endpoint.replace("/search", "/images")
         
         # Prepare request
         headers = {
@@ -124,12 +141,16 @@ class SerperProvider(SearchProvider):
         if hl := kwargs.get("hl"):
             payload["hl"] = hl
         
+        # Add site restriction if specified
+        if site_restrict := kwargs.get("site_restrict"):
+            payload["q"] = f"{payload['q']} site:{site_restrict}"
+        
         try:
-            logger.debug(f"Initiating Serper search: {query}")
+            logger.debug(f"Initiating Serper {search_type} search: {query}")
             start_time = time.time()
             
             async with session.post(
-                self.base_url,
+                endpoint,
                 headers=headers,
                 json=payload
             ) as response:
@@ -169,10 +190,29 @@ class SerperProvider(SearchProvider):
                     error_text = await response.text()
                     self.key_manager.report_error(key=api_key)
                     logger.error(f"Serper API error: {response.status} - {error_text}")
-                    raise ValueError(f"API request failed: {error_text}")
+                    raise SearchError(f"API request failed: {error_text}")
                 
                 # Process successful response
                 data = await response.json()
+                
+                # Check for errors in response body (even with 200 status)
+                if "error" in data:
+                    error_msg = data["error"].get("message", "Unknown error")
+                    
+                    # Check if it's a quota exceeded message
+                    if "quota" in error_msg.lower() or "limit" in error_msg.lower():
+                        self.key_manager.report_error(
+                            key=api_key,
+                            is_rate_limit=True,
+                            reset_time=time.time() + 3600  # Default: 1 hour for quota limits
+                        )
+                        raise RateLimitError(
+                            provider="serper",
+                            retry_after=3600  # 1 hour default for quota limits
+                        )
+                        
+                    self.key_manager.report_error(key=api_key)
+                    raise SearchError(f"API error: {error_msg}")
                 
                 # Extract rate limit information if available
                 calls_remaining = None
@@ -181,6 +221,9 @@ class SerperProvider(SearchProvider):
                         calls_remaining = int(response.headers["X-RateLimit-Remaining"])
                     except ValueError:
                         pass
+                
+                # Add search type to response for parsing
+                data["_search_type"] = search_type
                 
                 # Report success to key manager
                 self.key_manager.report_success(
@@ -195,13 +238,14 @@ class SerperProvider(SearchProvider):
             # Network-related errors
             self.key_manager.report_error(key=api_key)
             logger.error(f"Serper request error: {str(e)}")
-            raise ValueError(f"Request failed: {str(e)}")
+            raise SearchError(f"Request failed: {str(e)}")
             
         except Exception as e:
             # Unexpected errors
-            if not isinstance(e, (RateLimitError, ApiKeyError)):
+            if not isinstance(e, (RateLimitError, ApiKeyError, SearchError)):
                 self.key_manager.report_error(key=api_key)
-            logger.error(f"Serper search error: {str(e)}")
+                logger.error(f"Serper search error: {str(e)}")
+                raise SearchError(f"Search failed: {str(e)}")
             raise
 
     def parse_results(self, raw_data: Dict[str, Any], query: str) -> List[SearchResult]:
@@ -217,10 +261,15 @@ class SerperProvider(SearchProvider):
         """
         results = []
         keywords = [w.lower() for w in query.split() if len(w) > 3]
+        search_type = raw_data.get("_search_type", "search")
         
         # Process organic results
         if "organic" in raw_data:
             for item in raw_data["organic"]:
+                # Skip if missing link
+                if "link" not in item:
+                    continue
+                    
                 result = SearchResult(
                     title=item.get("title", ""),
                     url=item.get("link", ""),
@@ -228,9 +277,25 @@ class SerperProvider(SearchProvider):
                     source="serper",
                     metadata={
                         "position": item.get("position"),
-                        "type": "organic"
+                        "type": "organic",
+                        "domain": extract_domain(item.get("link", ""))
                     }
                 )
+                
+                # Add sitelinks if available
+                if "sitelinks" in item:
+                    result.metadata["sitelinks"] = [
+                        {"title": sl.get("title", ""), "link": sl.get("link", "")}
+                        for sl in item["sitelinks"]
+                    ]
+                
+                # Add rich snippet data if available
+                if "rich_snippet" in item:
+                    result.metadata["rich_snippet"] = item["rich_snippet"]
+                
+                # Add thumbnail if available
+                if "imageUrl" in item:
+                    result.metadata["image_url"] = item["imageUrl"]
                 
                 # Score and add result
                 result = calculate_score(result, keywords)
@@ -239,21 +304,136 @@ class SerperProvider(SearchProvider):
         # Process knowledge graph results if available
         if "knowledgeGraph" in raw_data:
             kg = raw_data["knowledgeGraph"]
-            if "title" in kg and "link" in kg:
+            if "title" in kg:
+                # Use the link if provided, or create a search URL if not
+                url = kg.get("link", f"https://www.google.com/search?q={query.replace(' ', '+')}")
+                
                 result = SearchResult(
                     title=kg.get("title", ""),
-                    url=kg.get("link", ""),
+                    url=url,
                     snippet=kg.get("description", ""),
                     source="serper",
                     metadata={
                         "type": "knowledge_graph",
-                        "attributes": kg.get("attributes", {})
+                        "attributes": kg.get("attributes", {}),
+                        "knowledge_type": kg.get("type", "")
                     }
                 )
+                
+                # Add image if available
+                if "imageUrl" in kg:
+                    result.metadata["image_url"] = kg["imageUrl"]
                 
                 # Knowledge graph results get a scoring boost
                 result = calculate_score(result, keywords)
                 result.score += 0.2  # Boost knowledge graph results
+                results.append(result)
+        
+        # Process answer box if available
+        if "answerBox" in raw_data:
+            ab = raw_data["answerBox"]
+            # Answer box can have different formats
+            snippet = ab.get("snippet", ab.get("answer", ""))
+            
+            # Use the answer box URL or create a search URL if not available
+            url = ab.get("link", f"https://www.google.com/search?q={query.replace(' ', '+')}")
+            
+            result = SearchResult(
+                title=ab.get("title", "Featured Snippet"),
+                url=url,
+                snippet=snippet,
+                source="serper",
+                metadata={
+                    "type": "answer_box",
+                    "answer_type": "snippet" if "snippet" in ab else "direct_answer"
+                }
+            )
+            
+            # Add source if available
+            if "source" in ab:
+                result.metadata["source_name"] = ab["source"]
+            
+            # Answer box gets a high score boost
+            result = calculate_score(result, keywords)
+            result.score += 0.3  # Boost answer box results even higher
+            results.append(result)
+        
+        # Process related searches
+        if "relatedSearches" in raw_data:
+            for i, rs in enumerate(raw_data["relatedSearches"][:3]):  # Only include top 3
+                if "query" in rs:
+                    result = SearchResult(
+                        title=f"Related: {rs['query']}",
+                        url=f"https://www.google.com/search?q={rs['query'].replace(' ', '+')}",
+                        snippet=f"Related search query: {rs['query']}",
+                        source="serper",
+                        metadata={
+                            "type": "related_search",
+                            "position": i
+                        }
+                    )
+                    # Give a low base score to related searches
+                    result.score = 0.3
+                    results.append(result)
+        
+        # Process news results if available
+        if "news" in raw_data:
+            for item in raw_data["news"]:
+                if "link" not in item:
+                    continue
+                    
+                result = SearchResult(
+                    title=item.get("title", ""),
+                    url=item.get("link", ""),
+                    snippet=item.get("snippet", ""),
+                    source="serper",
+                    metadata={
+                        "type": "news",
+                        "domain": extract_domain(item.get("link", "")),
+                        "date": item.get("date", ""),
+                        "source": item.get("source", "")
+                    }
+                )
+                
+                # Add thumbnail if available
+                if "imageUrl" in item:
+                    result.metadata["image_url"] = item["imageUrl"]
+                
+                # Score news results, with a slight boost for news search
+                result = calculate_score(result, keywords)
+                if search_type == "news":
+                    result.score += 0.1
+                results.append(result)
+        
+        # Process image results if search type is images
+        if "images" in raw_data and search_type == "images":
+            for item in raw_data["images"]:
+                if "imageUrl" not in item:
+                    continue
+                    
+                # For images, we need both the source page and direct image URL
+                source_url = item.get("source", item.get("link", ""))
+                if not source_url.startswith(("http://", "https://")):
+                    source_url = f"https://www.google.com/search?q={query.replace(' ', '+')}&tbm=isch"
+                
+                result = SearchResult(
+                    title=item.get("title", ""),
+                    url=source_url,  # Source page URL
+                    snippet=item.get("title", ""),  # Use title as snippet for images
+                    source="serper",
+                    metadata={
+                        "type": "image",
+                        "image_url": item["imageUrl"],  # Direct image URL
+                        "source_page": source_url,
+                        "source_name": item.get("source", ""),
+                        "width": item.get("width"),
+                        "height": item.get("height")
+                    }
+                )
+                
+                # Score with a boost for image searches
+                result = calculate_score(result, keywords)
+                result.score += 0.15  # Boost image results
                 results.append(result)
         
         # Sort by score (descending)
