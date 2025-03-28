@@ -1,44 +1,53 @@
+# ai_agent_framework/core/communication/agent_protocol.py
+
 """
-Agent Protocol Module
+Agent Protocol Module (Async Refactor)
 
-This module provides the communication protocol for agents to interact with each other
-and with the orchestration system. It handles message passing, serialization,
-deserialization, and error recovery.
-
-The protocol supports both synchronous and asynchronous communication patterns.
+Handles the asynchronous communication protocol for agents, including message
+serialization, deserialization, delivery via HTTP, and basic error handling.
 """
 
+import asyncio
 import json
 import logging
 import uuid
 import time
-import queue
-import threading
-from typing import Dict, List, Any, Optional, Union, Callable
+from typing import Dict, List, Any, Optional, Union, Callable, Awaitable
 from dataclasses import dataclass, field, asdict
-
-# Networking
-import requests
 from urllib.parse import urljoin
 
-# Error handling
-from core.exceptions import CommunicationError, ProtocolError, DeserializationError
+import aiohttp
+from tenacity import retry, stop_after_attempt, wait_fixed, wait_exponential, retry_if_exception_type
+
+# Assume these exceptions are defined in core.exceptions
+# from ..core.exceptions import CommunicationError, ProtocolError, DeserializationError
+# Placeholder exceptions if core.exceptions is missing:
+class CommunicationError(Exception): pass
+class ProtocolError(Exception): pass
+class DeserializationError(Exception): pass
+
 
 logger = logging.getLogger(__name__)
+
+# Default configuration
+DEFAULT_REQUEST_TIMEOUT = 30.0
+DEFAULT_RETRIES = 3
+DEFAULT_RETRY_DELAY = 1.0 # Base delay for exponential backoff
 
 @dataclass
 class AgentMessage:
     """
-    Represents a message exchanged between agents or between agents and the orchestrator.
-    
+    Represents a message exchanged between agents or components. (Unchanged from original)
+
     Attributes:
-        sender: Identifier of the sending agent
-        recipient: Identifier of the receiving agent
-        content: Message payload (must be JSON serializable)
-        message_type: Type of message (e.g., "task_execute", "task_complete")
-        message_id: Unique identifier for the message
-        correlation_id: ID for correlating related messages
-        timestamp: Time when the message was created
+        sender: Identifier of the sending agent/component.
+        recipient: Identifier of the receiving agent/component.
+        content: Message payload (must be JSON serializable dictionary).
+        message_type: Type of message (e.g., "task_execute", "task_complete").
+        message_id: Unique identifier for the message.
+        correlation_id: ID for correlating related messages (e.g., request/response).
+        timestamp: Time when the message was created.
+        metadata: Optional dictionary for additional metadata.
     """
     sender: str
     recipient: str
@@ -47,304 +56,285 @@ class AgentMessage:
     message_id: str = field(default_factory=lambda: str(uuid.uuid4()))
     correlation_id: Optional[str] = None
     timestamp: float = field(default_factory=time.time)
-    
+    metadata: Dict[str, Any] = field(default_factory=dict)
+
     def to_dict(self) -> Dict[str, Any]:
-        """
-        Convert the message to a dictionary for serialization.
-        
-        Returns:
-            Dict representation of the message
-        """
+        """Convert the message to a dictionary for serialization."""
         return asdict(self)
-    
+
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> 'AgentMessage':
-        """
-        Create a message from a dictionary.
-        
-        Args:
-            data: Dictionary containing message data
-            
-        Returns:
-            AgentMessage instance
-            
-        Raises:
-            DeserializationError: If the message data is invalid
-        """
+        """Create a message from a dictionary."""
         required_fields = ['sender', 'recipient', 'content', 'message_type']
-        
-        # Validate required fields
-        for field in required_fields:
-            if field not in data:
-                raise DeserializationError(f"Missing required field '{field}' in message data")
-        
-        # Ensure content is a dictionary
-        if not isinstance(data['content'], dict):
-            # Try to parse content if it's a string
-            if isinstance(data['content'], str):
-                try:
-                    data['content'] = json.loads(data['content'])
-                except json.JSONDecodeError:
-                    # If not JSON, wrap in a dictionary
-                    data['content'] = {'data': data['content']}
-            else:
-                # If not a string or dict, wrap in a dictionary
-                data['content'] = {'data': data['content']}
-        
+        if not all(field in data for field in required_fields):
+            missing = [field for field in required_fields if field not in data]
+            raise DeserializationError(f"Missing required field(s): {', '.join(missing)}")
+
+        # Ensure content is a dictionary, attempting deserialization if it's a JSON string
+        content = data['content']
+        if isinstance(content, str):
+            try:
+                content = json.loads(content)
+                if not isinstance(content, dict):
+                     raise DeserializationError("Message content (deserialized from string) must be a dictionary.")
+            except json.JSONDecodeError as e:
+                raise DeserializationError(f"Failed to decode content string as JSON: {e}")
+        elif not isinstance(content, dict):
+             raise DeserializationError("Message content must be a dictionary or a valid JSON string representing one.")
+
         try:
             return cls(
                 sender=data['sender'],
                 recipient=data['recipient'],
-                content=data['content'],
+                content=content,
                 message_type=data['message_type'],
                 message_id=data.get('message_id', str(uuid.uuid4())),
                 correlation_id=data.get('correlation_id'),
-                timestamp=data.get('timestamp', time.time())
+                timestamp=data.get('timestamp', time.time()),
+                metadata=data.get('metadata', {}) # Ensure metadata is always a dict
             )
+        except TypeError as e:
+            raise DeserializationError(f"Failed to create message from data due to type error: {e}")
         except Exception as e:
-            raise DeserializationError(f"Failed to create message from data: {str(e)}")
-    
+            # Catch other potential errors during instantiation
+            raise DeserializationError(f"Unexpected error creating message from data: {e}")
+
     def validate(self) -> bool:
-        """
-        Validate the message for correctness.
-        
-        Returns:
-            True if the message is valid, False otherwise
-        """
-        # Check required fields
-        if not self.sender or not self.recipient or not self.message_type:
+        """Validate the message structure and basic types."""
+        if not all([self.sender, self.recipient, self.message_type, self.message_id]):
             return False
-        
-        # Check content type
         if not isinstance(self.content, dict):
             return False
-        
-        # Additional validation could be added here
-        
+        if not isinstance(self.metadata, dict):
+             return False
+        # Basic type checks
+        if not isinstance(self.sender, str) or not isinstance(self.recipient, str): return False
+        if not isinstance(self.message_type, str): return False
+        if self.correlation_id is not None and not isinstance(self.correlation_id, str): return False
+        if not isinstance(self.timestamp, (int, float)): return False
+
         return True
+
 
 class AgentProtocol:
     """
-    Protocol implementation for agent communication.
-    
-    This class handles:
-    1. Serialization and deserialization of messages
-    2. Message delivery and receipt
-    3. Error recovery and retries
-    4. Message queuing for asynchronous communication
-    
-    Attributes:
-        endpoints: Mapping of agent IDs to their API endpoints
-        message_handlers: Mapping of message types to handler functions
-        inbox: Queue of received messages
-        response_queues: Mapping of message IDs to their response queues
+    Asynchronous protocol implementation for agent communication via HTTP.
+
+    Handles message serialization, delivery with retries, and basic routing
+    of incoming messages to registered handlers or response queues.
     """
-    
-    def __init__(self, endpoints: Optional[Dict[str, str]] = None):
+
+    DEFAULT_MESSAGE_ENDPOINT_PATH = "/message" # Define as constant
+
+    def __init__(self, endpoints: Optional[Dict[str, str]] = None, own_id: Optional[str] = "protocol_instance"):
         """
-        Initialize a new AgentProtocol.
-        
+        Initialize the asynchronous AgentProtocol.
+
         Args:
-            endpoints: Mapping of agent IDs to their API endpoints
+            endpoints: Mapping of agent IDs to their base HTTP API endpoints.
+            own_id: Identifier for this protocol instance (used for logging).
         """
         self.endpoints = endpoints or {}
-        self.message_handlers: Dict[str, Callable] = {}
-        self.inbox = queue.Queue()
-        self.response_queues: Dict[str, queue.Queue] = {}
-        
-        # Thread for processing incoming messages
-        self._stop_processing = threading.Event()
-        self._processing_thread = threading.Thread(
-            target=self._process_inbox,
-            daemon=True,
-            name="agent-protocol-processor"
-        )
-        self._processing_thread.start()
-    
+        self._message_handlers: Dict[str, Callable[[AgentMessage], Awaitable[None]]] = {}
+        self._response_waiters: Dict[str, asyncio.Future] = {}
+        self._session: Optional[aiohttp.ClientSession] = None
+        self._session_lock = asyncio.Lock()
+        self._processing_tasks: Set[asyncio.Task] = set()
+        self.own_id = own_id
+
+    async def _get_session(self) -> aiohttp.ClientSession:
+        """Get or create an aiohttp ClientSession."""
+        async with self._session_lock:
+            if self._session is None or self._session.closed:
+                # Consider configuring timeouts, connector limits etc. here
+                self._session = aiohttp.ClientSession(
+                     timeout=aiohttp.ClientTimeout(total=DEFAULT_REQUEST_TIMEOUT)
+                )
+                logger.info(f"[{self.own_id}] Created new aiohttp session.")
+            return self._session
+
     def register_endpoint(self, agent_id: str, endpoint: str) -> None:
-        """
-        Register an endpoint for an agent.
-        
-        Args:
-            agent_id: Identifier of the agent
-            endpoint: API endpoint URL for the agent
-        """
+        """Register or update the endpoint URL for an agent."""
         self.endpoints[agent_id] = endpoint
-    
-    def register_handler(self, message_type: str, handler: Callable) -> None:
+        logger.info(f"[{self.own_id}] Registered endpoint for '{agent_id}': {endpoint}")
+
+    def register_handler(self, message_type: str, handler: Callable[[AgentMessage], Awaitable[None]]) -> None:
+        """Register an async handler coroutine for a specific message type."""
+        if not asyncio.iscoroutinefunction(handler):
+            raise TypeError(f"Handler for '{message_type}' must be an async function (coroutine).")
+        self._message_handlers[message_type] = handler
+        logger.info(f"[{self.own_id}] Registered handler for message type '{message_type}'.")
+
+    @retry(
+        stop=stop_after_attempt(DEFAULT_RETRIES + 1),
+        wait=wait_exponential(multiplier=DEFAULT_RETRY_DELAY, min=1, max=10), # Exponential backoff
+        retry=retry_if_exception_type((aiohttp.ClientError, asyncio.TimeoutError, CommunicationError)),
+        before_sleep=lambda retry_state: logger.warning(f"Retrying send to {retry_state.args[0].recipient} after error: {retry_state.outcome.exception()}. Attempt {retry_state.attempt_number}...")
+    )
+    async def send(self, message: AgentMessage, request_timeout: float = DEFAULT_REQUEST_TIMEOUT) -> None:
         """
-        Register a handler for a specific message type.
-        
+        Asynchronously send a message to the recipient via HTTP POST.
+
         Args:
-            message_type: Type of message to handle
-            handler: Function to call when a message of this type is received
-        """
-        self.message_handlers[message_type] = handler
-    
-    def send(self, message: AgentMessage, retries: int = 3, timeout: float = 10.0) -> None:
-        """
-        Send a message to the recipient.
-        
-        Args:
-            message: Message to send
-            retries: Number of retry attempts
-            timeout: Timeout for request in seconds
-            
+            message: The AgentMessage to send.
+            request_timeout: Specific timeout for this request.
+
         Raises:
-            CommunicationError: If the message cannot be delivered
+            ProtocolError: If the message is invalid or serialization fails.
+            CommunicationError: If the recipient endpoint is unknown or delivery fails after retries.
+            aiohttp.ClientError: For underlying HTTP client issues.
+            asyncio.TimeoutError: If the request times out.
         """
         if not message.validate():
-            raise ProtocolError("Invalid message")
-        
+            raise ProtocolError(f"[{self.own_id}] Attempted to send invalid message: {message.message_id}")
+
         recipient = message.recipient
-        
-        # Local delivery
-        if recipient == "local":
-            self.inbox.put(message)
-            return
-        
-        # Check if we have an endpoint for the recipient
         if recipient not in self.endpoints:
-            raise CommunicationError(f"No endpoint registered for agent '{recipient}'")
-        
+            raise CommunicationError(f"[{self.own_id}] No endpoint registered for agent '{recipient}'.")
+
         endpoint = self.endpoints[recipient]
-        
-        # Serialize the message
+        target_url = urljoin(endpoint, self.DEFAULT_MESSAGE_ENDPOINT_PATH)
+
         try:
-            message_data = json.dumps(message.to_dict())
-        except Exception as e:
-            raise ProtocolError(f"Failed to serialize message: {str(e)}")
-        
-        # Send the message with retries
-        attempt = 0
-        last_error = None
-        
-        while attempt <= retries:
-            try:
-                response = requests.post(
-                    urljoin(endpoint, "/message"),
-                    data=message_data,
-                    headers={"Content-Type": "application/json"},
-                    timeout=timeout
-                )
-                
-                if response.status_code == 200:
-                    return
+            message_json = json.dumps(message.to_dict())
+        except TypeError as e:
+            raise ProtocolError(f"[{self.own_id}] Failed to serialize message {message.message_id}: {e}")
+
+        session = await self._get_session()
+        logger.debug(f"[{self.own_id}] Sending message {message.message_id} to {recipient} at {target_url}")
+
+        try:
+            async with session.post(
+                target_url,
+                data=message_json,
+                headers={"Content-Type": "application/json"},
+                timeout=request_timeout # Use specific timeout for this request
+            ) as response:
+                if response.status >= 200 and response.status < 300:
+                    logger.debug(f"[{self.own_id}] Message {message.message_id} delivered successfully to {recipient} (Status: {response.status}).")
+                    return # Success
                 else:
-                    error_msg = f"Failed to deliver message: HTTP {response.status_code}"
-                    logger.warning(error_msg)
-                    last_error = CommunicationError(error_msg)
-                    
-            except (requests.RequestException, ConnectionError) as e:
-                logger.warning(f"Error delivering message to {recipient}: {str(e)}")
-                last_error = CommunicationError(f"Communication error: {str(e)}")
-                
-            # Retry with backoff
-            attempt += 1
-            if attempt <= retries:
-                time.sleep(min(2 ** attempt, 30))  # Exponential backoff, max 30s
-        
-        # All retries failed
-        raise last_error if last_error else CommunicationError("Failed to deliver message after retries")
-    
-    def send_and_receive(
-        self, 
-        message: AgentMessage, 
-        timeout: float = 30.0,
-        retries: int = 3
-    ) -> Optional[AgentMessage]:
+                    # Raise CommunicationError for non-2xx responses to potentially trigger retry
+                    error_text = await response.text()
+                    raise CommunicationError(f"[{self.own_id}] Failed to deliver message {message.message_id} to {recipient}. Status: {response.status}, Response: {error_text[:200]}")
+
+        except aiohttp.ClientError as e:
+             logger.error(f"[{self.own_id}] HTTP Client error sending message {message.message_id} to {recipient}: {e}")
+             raise # Allow tenacity to handle retry
+        except asyncio.TimeoutError:
+             logger.error(f"[{self.own_id}] Timeout sending message {message.message_id} to {recipient} after {request_timeout}s.")
+             raise # Allow tenacity to handle retry
+        except Exception as e:
+             # Catch unexpected errors during send
+             logger.exception(f"[{self.own_id}] Unexpected error sending message {message.message_id}: {e}")
+             # Wrap in CommunicationError so retry logic might catch it if configured
+             raise CommunicationError(f"Unexpected error during send: {e}")
+
+
+    async def send_and_receive(
+        self,
+        message: AgentMessage,
+        response_timeout: float = DEFAULT_REQUEST_TIMEOUT,
+        send_request_timeout: float = DEFAULT_REQUEST_TIMEOUT
+    ) -> AgentMessage:
         """
-        Send a message and wait for a response.
-        
+        Asynchronously send a message and wait for a correlated response.
+
         Args:
-            message: Message to send
-            timeout: Timeout for waiting for response in seconds
-            retries: Number of retry attempts for sending
-            
+            message: The message to send.
+            response_timeout: How long to wait for the response message.
+            send_request_timeout: Timeout for the initial send request.
+
         Returns:
-            Response message or None if no response is received
-            
+            The response AgentMessage.
+
         Raises:
-            CommunicationError: If the message cannot be delivered
-            TimeoutError: If no response is received within the timeout
+            asyncio.TimeoutError: If no response is received within the timeout.
+            CommunicationError, ProtocolError: If sending fails.
         """
-        # Create a response queue for this message
-        response_queue = queue.Queue()
-        self.response_queues[message.message_id] = response_queue
-        
+        if not message.message_id:
+             raise ProtocolError("Message must have an ID for send_and_receive.")
+
+        future: asyncio.Future[AgentMessage] = asyncio.get_running_loop().create_future()
+        self._response_waiters[message.message_id] = future
+
         try:
-            # Send the message
-            self.send(message, retries=retries)
-            
-            # Wait for response
-            try:
-                response = response_queue.get(timeout=timeout)
-                return response
-            except queue.Empty:
-                raise TimeoutError(f"No response received within {timeout}s")
-                
-        finally:
-            # Clean up
-            if message.message_id in self.response_queues:
-                del self.response_queues[message.message_id]
-    
-    def receive(self, message_data: Dict[str, Any]) -> None:
-        """
-        Process a received message.
-        
-        Args:
-            message_data: Dictionary containing message data
-            
-        Raises:
-            DeserializationError: If the message data is invalid
-        """
-        try:
-            # Deserialize the message
-            message = AgentMessage.from_dict(message_data)
-            
-            # Put the message in the inbox
-            self.inbox.put(message)
-            
+            await self.send(message, request_timeout=send_request_timeout)
+            logger.debug(f"[{self.own_id}] Message {message.message_id} sent, awaiting response...")
+            # Wait for the future to be set by the receive method
+            response_message = await asyncio.wait_for(future, timeout=response_timeout)
+            return response_message
+        except asyncio.TimeoutError:
+            logger.warning(f"[{self.own_id}] Timeout waiting for response to message {message.message_id}.")
+            raise
         except Exception as e:
-            logger.error(f"Error processing received message: {str(e)}")
-            raise DeserializationError(f"Failed to process message: {str(e)}")
-    
-    def _process_inbox(self) -> None:
+            logger.error(f"[{self.own_id}] Error during send_and_receive for message {message.message_id}: {e}")
+            raise # Propagate send errors
+        finally:
+            # Clean up waiter
+            self._response_waiters.pop(message.message_id, None)
+
+
+    def process_received_data(self, message_data: Dict[str, Any]) -> None:
         """
-        Background thread for processing incoming messages.
+        Entry point for processing received message data (e.g., from an HTTP endpoint).
+        Deserializes and routes the message for background processing.
+
+        Args:
+            message_data: Raw dictionary data received.
         """
-        while not self._stop_processing.is_set():
+        try:
+            message = AgentMessage.from_dict(message_data)
+            logger.debug(f"[{self.own_id}] Received message {message.message_id} from {message.sender} for {message.recipient}")
+
+            # Create a task to handle the message processing asynchronously
+            task = asyncio.create_task(self._handle_received_message(message))
+            self._processing_tasks.add(task)
+            task.add_done_callback(self._processing_tasks.discard) # Auto-remove on completion
+
+        except DeserializationError as e:
+            logger.error(f"[{self.own_id}] Failed to deserialize received message data: {e}. Data: {message_data}")
+            # Optionally, send an error response back if possible/appropriate
+        except Exception as e:
+            logger.exception(f"[{self.own_id}] Unexpected error receiving/scheduling message processing: {e}")
+
+
+    async def _handle_received_message(self, message: AgentMessage) -> None:
+        """Handles a deserialized message in the background."""
+        # Check if this is a response to a waiting request
+        if message.correlation_id and message.correlation_id in self._response_waiters:
+            future = self._response_waiters.get(message.correlation_id)
+            if future and not future.done():
+                future.set_result(message)
+                # Don't process further via handlers if it was a direct response
+                return
+
+        # Handle via registered message handlers
+        handler = self._message_handlers.get(message.message_type)
+        if handler:
             try:
-                # Get a message from the inbox
-                try:
-                    message = self.inbox.get(timeout=1.0)
-                except queue.Empty:
-                    continue
-                
-                # Check if this is a response to a pending request
-                if message.correlation_id and message.correlation_id in self.response_queues:
-                    self.response_queues[message.correlation_id].put(message)
-                    self.inbox.task_done()
-                    continue
-                
-                # Handle based on message type
-                if message.message_type in self.message_handlers:
-                    try:
-                        self.message_handlers[message.message_type](message)
-                    except Exception as e:
-                        logger.error(f"Error in message handler for '{message.message_type}': {str(e)}")
-                else:
-                    logger.warning(f"No handler registered for message type '{message.message_type}'")
-                
-                self.inbox.task_done()
-                
+                await handler(message)
             except Exception as e:
-                logger.error(f"Error in message processing thread: {str(e)}")
-    
-    def shutdown(self) -> None:
-        """
-        Gracefully shut down the protocol.
-        """
-        self._stop_processing.set()
-        if self._processing_thread.is_alive():
-            self._processing_thread.join(timeout=5)
+                logger.exception(f"[{self.own_id}] Error in handler for message type '{message.message_type}' (ID: {message.message_id}): {e}")
+        else:
+            logger.warning(f"[{self.own_id}] No handler registered for message type '{message.message_type}' (ID: {message.message_id})")
+
+    async def shutdown(self) -> None:
+        """Gracefully shut down the protocol client and background tasks."""
+        logger.info(f"[{self.own_id}] Shutting down AgentProtocol...")
+
+        # Cancel any ongoing processing tasks
+        if self._processing_tasks:
+            logger.info(f"[{self.own_id}] Cancelling {len(self._processing_tasks)} background message processing tasks...")
+            for task in list(self._processing_tasks):
+                task.cancel()
+            await asyncio.gather(*self._processing_tasks, return_exceptions=True)
+            logger.info(f"[{self.own_id}] Background tasks cancelled.")
+
+        # Close the aiohttp session
+        async with self._session_lock:
+            if self._session and not self._session.closed:
+                await self._session.close()
+                self._session = None
+                logger.info(f"[{self.own_id}] Closed aiohttp session.")
+        logger.info(f"[{self.own_id}] AgentProtocol shutdown complete.")
