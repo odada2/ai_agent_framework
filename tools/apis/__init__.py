@@ -1,22 +1,31 @@
-"""
-Web Search Package
+# ai_agent_framework/tools/apis/__init__.py
 
-This package provides a comprehensive web search capability with:
-- Multiple search providers (Serper, Google, Bing)
-- Result caching and rate limiting
-- API key management and rotation
-- Standardized result format across providers
+"""
+APIs Tools Package
+
+This package provides tools for interacting with external APIs.
 """
 
-from .web_search import WebSearchTool
-from .base import SearchResult, SearchProvider, SearchError, RateLimitError, ApiKeyError
-from .providers.serper import SerperProvider
-from .providers.google import GoogleSearchProvider
-from .providers.bing import BingSearchProvider
-from .caching import get_cache
-from .api_key_manager import ApiKeyManager
+# Import from the web_search subdirectory structure
+from .web_search import (
+    WebSearchTool,
+    SearchResult,
+    SearchProvider,
+    SearchError,
+    RateLimitError,
+    ApiKeyError,
+    SerperProvider,
+    GoogleSearchProvider,
+    BingSearchProvider,
+    ApiKeyManager,
+    get_cache
+)
+
+# Import the new APIConnectorTool
+from .connector import APIConnectorTool
 
 __all__ = [
+    # Web Search related
     'WebSearchTool',
     'SearchResult',
     'SearchProvider',
@@ -27,5 +36,8 @@ __all__ = [
     'GoogleSearchProvider',
     'BingSearchProvider',
     'ApiKeyManager',
-    'get_cache'
+    'get_cache',
+
+    # General API Connector
+    'APIConnectorTool',
 ]

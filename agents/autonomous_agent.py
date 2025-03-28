@@ -1,12 +1,13 @@
+# ai_agent_framework/agents/autonomous_agent.py
+
 """
 Autonomous Agent
 
 This module provides an implementation of an autonomous agent that can plan and
-execute tasks using language models and tools. Unlike the workflow agent which follows
-predefined paths, the autonomous agent dynamically determines its own process flow.
+execute tasks using language models and tools asynchronously.
 """
 
-import asyncio
+import asyncio # Ensure asyncio is imported
 import logging
 import time
 from typing import Any, Dict, List, Optional, Union
@@ -16,6 +17,8 @@ from ..core.memory.conversation import ConversationMemory
 from ..core.tools.registry import ToolRegistry
 from ..core.tools.parser import ToolCallParser
 from .base_agent import BaseAgent
+# Assuming ToolError exists in core.exceptions
+# from ..core.exceptions import ToolError
 
 logger = logging.getLogger(__name__)
 
@@ -23,13 +26,11 @@ logger = logging.getLogger(__name__)
 class AutonomousAgent(BaseAgent):
     """
     An agent implementation that operates autonomously to accomplish tasks.
-    
-    The AutonomousAgent is more flexible than the WorkflowAgent, as it dynamically
-    determines the actions to take based on the task at hand rather than following
-    predefined workflows. This makes it suitable for open-ended problems where
-    the required steps are not known in advance.
+
+    Uses asynchronous operations for planning, acting (including tool execution),
+    and reflection.
     """
-    
+
     def __init__(
         self,
         name: str,
@@ -45,32 +46,16 @@ class AutonomousAgent(BaseAgent):
     ):
         """
         Initialize the AutonomousAgent.
-        
-        Args:
-            name: A unique name for this agent instance
-            llm: The LLM implementation to use for this agent
-            tools: Optional registry of tools available to the agent
-            memory: Optional conversation memory for maintaining context
-            system_prompt: Optional system prompt to guide the agent's behavior
-            max_iterations: Maximum number of iterations the agent can perform in a run
-            reflection_threshold: Number of iterations after which the agent reflects on its progress
-            max_planning_depth: Maximum depth of planning recursion
-            verbose: Whether to log detailed information about the agent's operations
-            **kwargs: Additional agent-specific parameters
+        (Docstring remains the same)
         """
         # Use a default system prompt if none provided
         if system_prompt is None:
             system_prompt = (
-                "You are an autonomous AI assistant that helps users accomplish tasks. "
-                "You have access to tools that allow you to interact with external systems. "
-                "When presented with a task:\n"
-                "1. Think through what's needed and form a plan\n"
-                "2. Use available tools when necessary\n"
-                "3. Adapt your plan based on new information\n"
-                "4. Present clear, concise results to the user\n"
-                "Be thorough but efficient, and provide helpful responses."
+                "You are an autonomous AI assistant designed to accomplish tasks by planning, "
+                "using available tools, and reflecting on progress. Break down complex tasks, "
+                "execute steps methodically, adapt to tool results, and provide a clear final answer."
             )
-        
+
         super().__init__(
             name=name,
             llm=llm,
@@ -81,450 +66,393 @@ class AutonomousAgent(BaseAgent):
             verbose=verbose,
             **kwargs
         )
-        
+
         # Additional parameters specific to autonomous agents
         self.reflection_threshold = reflection_threshold
         self.max_planning_depth = max_planning_depth
-        
+
         # Set up tool call parser
         self.tool_call_parser = ToolCallParser()
-        
-        # Execution state
-        self.execution_state = {
-            "plan": None,
-            "current_step": None,
-            "completed_steps": [],
-            "tool_results": [],
-            "reflections": []
-        }
-    
+
+        # Execution state (reset in reset method)
+        self.execution_state: Dict[str, Any] = {}
+        self.reset() # Initialize execution state structure
+
+
     async def run(self, input_data: Union[str, Dict], **kwargs) -> Dict[str, Any]:
         """
-        Run the agent on the given input.
-        
-        This method processes the input, plans the approach, executes the plan,
-        and returns the result.
-        
-        Args:
-            input_data: The input data for the agent to process (string query or structured data)
-            **kwargs: Additional runtime parameters
-            
-        Returns:
-            A dictionary containing the agent's response and any additional metadata
+        Run the agent asynchronously on the given input.
+        (Docstring remains the same)
         """
-        # Reset for a new run
+        # Use await if BaseAgent.reset becomes async
         self.reset()
-        
-        # Extract task
-        task = input_data if isinstance(input_data, str) else str(input_data)
-        
-        # Add task to memory
+
+        task = input_data if isinstance(input_data, str) else input_data.get("input", str(input_data))
+        logger.info(f"[{self.name}] Starting run for task: {task[:100]}...")
         self.memory.add_user_message(task)
-        
+
         # Initialize state for this run
         self.state = {
             "task": task,
-            "start_time": time.time(),
+            "start_time": time.monotonic(),
             "last_reflection_iteration": 0
         }
-        
-        # Main execution loop
-        final_response = None
-        
+
+        final_response: Optional[str] = None
+
         try:
-            # Create initial plan
+            # Create initial plan (ensure _create_plan is async)
             self.execution_state["plan"] = await self._create_plan(task)
-            
-            while not self.finished and self._increment_iteration():
-                # Check if we need to reflect on progress
-                if (self.current_iteration - self.state["last_reflection_iteration"] 
-                        >= self.reflection_threshold):
+            logger.debug(f"[{self.name}] Initial plan: {self.execution_state['plan'].get('steps')}")
+
+            # Main execution loop
+            while not self.finished:
+                can_continue = self._increment_iteration() # Sync check
+                if not can_continue:
+                     logger.warning(f"[{self.name}] Max iterations reached.")
+                     self._mark_finished(success=False, error="Max iterations reached")
+                     break
+
+                logger.info(f"[{self.name}] Starting iteration {self.current_iteration}")
+
+                # --- Reflection Step ---
+                if (self.current_iteration > 1 and # Reflect after first action
+                    (self.current_iteration - self.state["last_reflection_iteration"]) >= self.reflection_threshold):
                     await self._reflect_on_progress()
                     self.state["last_reflection_iteration"] = self.current_iteration
-                
-                # Determine next action
+                    # Re-check if finished state changed during reflection
+                    if self.finished: break
+
+                # --- Action Step ---
+                # Determine next action (ensure _determine_next_action is async)
                 action_result = await self._determine_next_action()
-                
-                # If we got a final response, we're done
+
+                # Process action result
                 if action_result.get("finished", False):
-                    final_response = action_result.get("response")
+                    final_response = action_result.get("response", "Task concluded.")
                     self._mark_finished(success=True)
+                    logger.info(f"[{self.name}] Task determined to be finished.")
                     break
-                
-                # Otherwise, execute the determined action
-                if "tool_call" in action_result:
-                    tool_result = await self._execute_tool(action_result["tool_call"])
+                elif "tool_call" in action_result:
+                    # Execute the tool (use async _execute_tool)
+                    tool_result_info = await self._execute_tool(action_result["tool_call"])
+                    # Record tool usage and result (or error)
                     self.execution_state["tool_results"].append({
+                        "iteration": self.current_iteration,
                         "tool": action_result["tool_call"]["name"],
                         "input": action_result["tool_call"].get("parameters", {}),
-                        "result": tool_result
+                        "output": tool_result_info # Contains result or error
                     })
-                
-                # Update execution state
-                if "step" in action_result:
-                    self.execution_state["current_step"] = action_result["step"]
-                    if action_result.get("step_completed", False):
-                        self.execution_state["completed_steps"].append(action_result["step"])
-                        self.execution_state["current_step"] = None
-            
-            # If we didn't get a final response, generate one based on the accumulated context
-            if not final_response:
+                    # Optional: Add tool result summary to conversation memory for context?
+                    # summary = f"Tool {action_result['tool_call']['name']} executed. Result summary: {str(tool_result_info)[:100]}..."
+                    # self.memory.add_message(summary, role="system")
+                elif action_result.get("step_completed", False):
+                     completed_step_desc = action_result.get("step", self.execution_state.get("current_step", "Unknown step"))
+                     if completed_step_desc not in self.execution_state["completed_steps"]:
+                          self.execution_state["completed_steps"].append(completed_step_desc)
+                     logger.info(f"[{self.name}] Marked step as complete: {completed_step_desc}")
+                     # Move to next logical step based on plan (or let LLM decide in next iteration)
+                     self.execution_state["current_step"] = self._get_next_plan_step()
+                elif "error" in action_result:
+                     # Handle error in action determination
+                     logger.error(f"[{self.name}] Error during action determination: {action_result['error']}")
+                     # Decide whether to stop or let agent try to recover
+                     # For now, let's stop
+                     self._mark_finished(success=False, error=f"Action determination failed: {action_result['error']}")
+                     break
+                else:
+                     # No specific action, implies need for more thought/planning in next iteration
+                     logger.debug(f"[{self.name}] No specific action determined, proceeding to next iteration.")
+
+
+            # --- End of Loop ---
+
+            # Generate final response if loop finished without one
+            if final_response is None:
+                logger.info(f"[{self.name}] Generating final response after loop completion.")
                 final_response = await self._generate_final_response(task)
-            
-            # Store in memory
+                if not self.finished: # Mark finished if loop ended due to iterations etc.
+                     self._mark_finished(success=True) # Assume success if no errors occurred
+
+            # Store final response in memory
             self.memory.add_assistant_message(final_response)
-            
-            # Prepare the result object
+
+            # Prepare result object
+            run_duration = time.monotonic() - self.state["start_time"]
             result = {
                 "response": final_response,
                 "iterations": self.current_iteration,
+                "duration_seconds": run_duration,
                 "tool_calls": self.execution_state["tool_results"],
                 "finished": self.finished,
-                "success": self.success
+                "success": self.success,
+                "error": self.error # From BaseAgent state
             }
-            
+            logger.info(f"[{self.name}] Run finished. Success: {self.success}. Duration: {run_duration:.2f}s")
             return result
-            
+
         except Exception as e:
-            logger.exception(f"Error running autonomous agent: {str(e)}")
-            error_response = f"I encountered an error while working on your task: {str(e)}"
+            logger.exception(f"[{self.name}] Unhandled error during run: {e}")
+            error_response = f"I encountered an unexpected error: {e}"
+            self._mark_finished(success=False, error=str(e))
             self.memory.add_assistant_message(error_response)
-            
+            run_duration = time.monotonic() - self.state.get("start_time", time.monotonic())
             return {
                 "response": error_response,
                 "error": str(e),
                 "iterations": self.current_iteration,
+                 "duration_seconds": run_duration,
                 "tool_calls": self.execution_state["tool_results"],
                 "finished": True,
                 "success": False
             }
-    
-    async def _create_plan(self, task: str, depth: int = 0) -> Dict[str, Any]:
+
+    # Make _execute_tool asynchronous
+    async def _execute_tool(self, tool_call: Dict[str, Any]) -> Dict[str, Any]:
         """
-        Create a plan for accomplishing the task.
-        
+        Execute a tool call asynchronously using the ToolRegistry.
+
         Args:
-            task: The task to plan for
-            depth: Current planning recursion depth
-            
+            tool_call: Dictionary containing tool name and parameters.
+
         Returns:
-            Dictionary containing the plan details
+            The result from the tool's execute method (which includes errors).
         """
-        # Prevent excessive recursion
-        if depth >= self.max_planning_depth:
-            return {"steps": ["Complete the task directly"], "reasoning": "Plan simplified due to complexity."}
-        
-        # Generate tool descriptions if tools are available
-        tool_descriptions = ""
-        if self.tools and len(self.tools) > 0:
-            tool_descriptions = f"\n\nAvailable tools:\n{self.tools.get_tool_descriptions()}"
-        
-        # Create planning prompt
-        planning_prompt = (
-            f"Task: {task}\n\n"
-            f"Create a plan to accomplish this task.{tool_descriptions}\n\n"
-            f"Provide your plan in the following format:\n"
-            f"Reasoning: <your analysis of the task and approach>\n"
-            f"Plan:\n"
-            f"1. <first step>\n"
-            f"2. <second step>\n"
-            f"..."
-        )
-        
-        # Generate plan
-        planning_response = await self.llm.generate(
-            prompt=planning_prompt,
-            system_prompt="You are a strategic planning assistant that breaks down tasks into clear, actionable steps.",
-            temperature=0.3  # Lower temperature for more focused planning
-        )
-        
-        # Parse the response to extract the plan
-        response_text = planning_response.get("content", "")
-        
-        # Extract reasoning and steps
-        reasoning = ""
-        if "Reasoning:" in response_text:
-            reasoning_parts = response_text.split("Reasoning:")[1].split("Plan:")
-            reasoning = reasoning_parts[0].strip()
-        
-        # Extract steps, handling different formats
-        steps = []
-        if "Plan:" in response_text:
-            plan_text = response_text.split("Plan:")[1].strip()
-            # Handle numbered list
-            for line in plan_text.split("\n"):
-                line = line.strip()
-                if line and (line[0].isdigit() or line.startswith("-")):
-                    # Remove number/bullet and strip
-                    step = line
-                    if line[0].isdigit() and ". " in line:
-                        step = line.split(". ", 1)[1]
-                    elif line.startswith("- "):
-                        step = line[2:]
-                    steps.append(step)
-        
-        # If no steps were found, extract them differently
-        if not steps:
-            # Fallback: just use the lines after "Plan:" as steps
-            if "Plan:" in response_text:
-                plan_text = response_text.split("Plan:")[1].strip()
-                steps = [line.strip() for line in plan_text.split("\n") if line.strip()]
-            else:
-                # Last resort: treat the whole response as a single step
-                steps = [response_text.strip()]
-        
-        return {
-            "reasoning": reasoning,
-            "steps": steps,
-            "created_at": time.time()
-        }
-    
-    async def _determine_next_action(self) -> Dict[str, Any]:
-        """
-        Determine the next action to take based on the current state.
-        
-        Returns:
-            Dictionary containing the next action details
-        """
-        # Prepare context with task, plan, and execution history
-        context = self._prepare_execution_context()
-        
-        # Generate action prompt
-        action_prompt = (
-            f"{context}\n\n"
-            f"Determine the next action to take. You can:\n"
-            f"1. Use a tool to gather information or perform an action\n"
-            f"2. Mark the current step as completed and move to the next step\n"
-            f"3. Complete the task and provide a final response to the user\n\n"
-            f"Respond in ONE of the following formats:\n\n"
-            f"Option 1 - Use a tool:\n"
-            f"```json\n"
-            f'{{"action": "use_tool", "tool": "<tool_name>", "parameters": {{"param1": "value", "param2": "value"}}}}\n'
-            f"```\n\n"
-            f"Option 2 - Move to next step:\n"
-            f"```json\n"
-            f'{{"action": "next_step", "completed": "<current step description>", "reasoning": "<why this step is complete>"}}\n'
-            f"```\n\n"
-            f"Option 3 - Complete task:\n"
-            f"```json\n"
-            f'{{"action": "complete", "response": "<final response to user>"}}\n'
-            f"```\n"
-        )
-        
-        # Generate action decision
-        action_response = await self.llm.generate(
-            prompt=action_prompt,
-            system_prompt="You are a decision-making assistant that determines the next action to take in a task.",
-            temperature=0.2  # Lower temperature for more focused decisions
-        )
-        
-        # Parse the response to extract the action
-        response_text = action_response.get("content", "")
-        
-        # Extract JSON from response if present
-        tool_calls = self.tool_call_parser.parse_tool_calls(response_text)
-        
-        if tool_calls:
-            action_data = tool_calls[0]  # Use the first parsed tool call
-        else:
-            # No structured data found, assume it's a final response
-            logger.warning("No structured action found in response, treating as final response")
-            return {"finished": True, "response": response_text}
-        
-        # Process based on action type
-        action_type = action_data.get("action", "").lower()
-        
-        if action_type == "use_tool":
-            tool_name = action_data.get("tool", "")
-            parameters = action_data.get("parameters", {})
-            
-            # Check if tool exists
-            if not tool_name or not self.tools or not self.tools.has_tool(tool_name):
-                logger.warning(f"Tool '{tool_name}' not found or not available")
-                return {
-                    "step": self.execution_state["current_step"],
-                    "error": f"Tool '{tool_name}' not found or not available"
-                }
-            
-            return {
-                "step": self.execution_state["current_step"],
-                "tool_call": {"name": tool_name, "parameters": parameters}
-            }
-            
-        elif action_type == "next_step":
-            completed_step = action_data.get("completed", "")
-            reasoning = action_data.get("reasoning", "")
-            
-            # Mark current step as completed
-            return {
-                "step": completed_step,
-                "step_completed": True,
-                "reasoning": reasoning
-            }
-            
-        elif action_type == "complete":
-            final_response = action_data.get("response", "")
-            
-            # Task is complete
-            return {
-                "finished": True,
-                "response": final_response
-            }
-            
-        else:
-            # Unknown action type, treat as a continuation
-            return {
-                "step": self.execution_state["current_step"]
-            }
-    
-    async def _execute_tool(self, tool_call: Dict[str, Any]) -> Any:
-        """
-        Execute a tool with the given parameters.
-        
-        Args:
-            tool_call: Dictionary containing tool name and parameters
-            
-        Returns:
-            The result of the tool execution
-        """
-        tool_name = tool_call["name"]
+        tool_name = tool_call.get("name")
         parameters = tool_call.get("parameters", {})
-        
-        logger.info(f"Executing tool '{tool_name}' with parameters: {parameters}")
-        
+
+        if not tool_name:
+            logger.error(f"[{self.name}] Tool call missing 'name'.")
+            return {"error": "Tool call missing 'name'."}
+
+        if not self.tools.has_tool(tool_name):
+            logger.error(f"[{self.name}] Tool '{tool_name}' not found in registry.")
+            return {"error": f"Tool '{tool_name}' not found."}
+
+        logger.info(f"[{self.name}] Executing tool '{tool_name}' with parameters: {parameters}")
         try:
-            result = self.tools.execute_tool(tool_name, **parameters)
+            # Await the asynchronous execute_tool method from the registry
+            result = await self.tools.execute_tool(tool_name, **parameters)
+            logger.info(f"[{self.name}] Tool '{tool_name}' executed successfully.")
+            logger.debug(f"[{self.name}] Tool '{tool_name}' result: {str(result)[:200]}...") # Log truncated result
+            # The result itself might contain an 'error' key if the tool's execution failed internally
             return result
         except Exception as e:
-            logger.exception(f"Error executing tool '{tool_name}': {str(e)}")
-            return {"error": str(e)}
-    
+            # Catch errors during the awaiting of execute_tool itself
+            logger.exception(f"[{self.name}] Unexpected error awaiting tool execution for '{tool_name}': {e}")
+            return {"error": f"Failed to execute tool '{tool_name}': {e}"}
+
+
+    # --- Other methods (_create_plan, _determine_next_action, _reflect_on_progress, etc.) ---
+    # Assume these are already async or update them if they perform async operations (like LLM calls)
+
+    async def _create_plan(self, task: str, depth: int = 0) -> Dict[str, Any]:
+        """(Async) Create a plan for accomplishing the task."""
+        # (Implementation remains largely the same as provided before, ensure LLM call is awaited)
+        if depth >= self.max_planning_depth:
+            return {"steps": ["Complete the task directly"], "reasoning": "Plan simplified due to complexity."}
+
+        tool_descriptions = self.tools.get_tool_descriptions() if self.tools and len(self.tools) > 0 else "No tools available."
+
+        planning_prompt = f"Task: {task}\n\nAvailable tools:\n{tool_descriptions}\n\nCreate a step-by-step plan. Format:\nReasoning: <analysis>\nPlan:\n1. <step 1>\n2. <step 2>..."
+        system_prompt = "You are a strategic planner."
+
+        planning_response = await self.llm.generate(prompt=planning_prompt, system_prompt=system_prompt, temperature=0.3)
+        response_text = planning_response.get("content", "")
+
+        reasoning = ""
+        if "Reasoning:" in response_text:
+            reasoning = response_text.split("Reasoning:", 1)[1].split("Plan:", 1)[0].strip()
+
+        steps = []
+        if "Plan:" in response_text:
+            plan_text = response_text.split("Plan:", 1)[1].strip()
+            steps = [line.split(". ", 1)[1].strip() if '. ' in line else line.lstrip('- ').strip()
+                     for line in plan_text.split('\n') if line.strip() and (line.strip().startswith(tuple(f"{i}." for i in range(10))) or line.strip().startswith('-'))]
+        if not steps: steps = [response_text] if response_text else ["No plan generated."]
+
+
+        return {"reasoning": reasoning, "steps": steps, "created_at": time.monotonic()}
+
+
+    async def _determine_next_action(self) -> Dict[str, Any]:
+        """(Async) Determine the next action based on current state."""
+        # (Implementation remains largely the same as provided before, ensure LLM call is awaited)
+        context = self._prepare_execution_context() # Sync method
+
+        # Define the action choices clearly for the LLM
+        action_prompt = (
+            f"{context}\n\n"
+            f"## Instruction:\n"
+            f"Based on the current state, decide the single best next action. Choose ONE option below and respond ONLY with the corresponding JSON structure:\n\n"
+            f"1. **Use a Tool:** If you need external information or action.\n"
+            f"   ```json\n"
+            f'   {{"action": "use_tool", "tool": "<tool_name>", "parameters": {{"arg1": "value1", ...}}}}\n'
+            f"   ```\n\n"
+            f"2. **Mark Step Complete:** If the *current* step is finished and you are ready for the next one.\n"
+            f"   ```json\n"
+            f'   {{"action": "next_step", "completed_step": "<description of the step just finished>"}}\n'
+            f"   ```\n\n"
+            f"3. **Complete Task:** If the overall task is fully accomplished.\n"
+            f"   ```json\n"
+            f'   {{"action": "complete", "response": "<Final comprehensive response to the user>"}}\n'
+            f"   ```\n"
+        )
+        system_prompt = "You are an autonomous agent deciding the next action. Analyze the context and choose ONE action format. Respond ONLY in JSON."
+
+        try:
+            action_response = await self.llm.generate(prompt=action_prompt, system_prompt=system_prompt, temperature=0.1)
+            response_text = action_response.get("content", "").strip()
+
+            # Use ToolCallParser to extract JSON robustly
+            parsed_calls = self.tool_call_parser.parse_tool_calls(response_text)
+
+            if parsed_calls:
+                 action_data = parsed_calls[0].get("parameters", parsed_calls[0]) # Handle potential nesting by parser
+                 action_type = action_data.get("action", "").lower()
+
+                 if action_type == "use_tool":
+                      tool_name = action_data.get("tool")
+                      parameters = action_data.get("parameters", {})
+                      if not tool_name or not isinstance(parameters, dict):
+                           return {"error": "Invalid 'use_tool' action format."}
+                      if not self.tools.has_tool(tool_name):
+                           return {"error": f"Action specifies non-existent tool: '{tool_name}'"}
+                      return {"action": "use_tool", "tool_call": {"name": tool_name, "parameters": parameters}}
+
+                 elif action_type == "next_step":
+                      completed = action_data.get("completed_step")
+                      if not completed: return {"error": "Invalid 'next_step' action format."}
+                      return {"action": "next_step", "step_completed": True, "step": completed}
+
+                 elif action_type == "complete":
+                      final_resp = action_data.get("response")
+                      if final_resp is None: return {"error": "Invalid 'complete' action format."}
+                      return {"action": "complete", "finished": True, "response": final_resp}
+                 else:
+                      return {"error": f"Unknown action type received: '{action_type}'"}
+            else:
+                 # If no JSON is found, maybe LLM responded directly? Treat as final response?
+                 logger.warning(f"Could not parse structured action from LLM response: {response_text}")
+                 # This fallback might be risky, depends on desired agent behavior
+                 # return {"action": "complete", "finished": True, "response": response_text}
+                 return {"error": f"Could not parse valid action JSON from LLM response."}
+
+        except Exception as e:
+             logger.exception(f"Error determining next action: {e}")
+             return {"error": f"Failed to determine next action: {e}"}
+
+
     async def _reflect_on_progress(self) -> None:
-        """
-        Reflect on the progress made so far and adjust the plan if needed.
-        """
+        """(Async) Reflect on progress and potentially adjust plan."""
+        # (Implementation remains largely the same as provided before, ensure LLM calls are awaited)
         context = self._prepare_execution_context()
-        
-        reflection_prompt = (
-            f"{context}\n\n"
-            f"Reflect on the progress made so far. Consider:\n"
-            f"1. What has been accomplished?\n"
-            f"2. What challenges or obstacles have been encountered?\n"
-            f"3. Is the current plan still effective or does it need adjustment?\n"
-            f"4. What should be the focus for the next steps?\n\n"
-            f"Provide your reflection and any adjustments to the plan."
-        )
-        
-        reflection_response = await self.llm.generate(
-            prompt=reflection_prompt,
-            system_prompt="You are a reflective assistant that evaluates progress and adjusts plans accordingly.",
-            temperature=0.3
-        )
-        
+        logger.info(f"[{self.name}] Reflecting on progress at iteration {self.current_iteration}")
+
+        reflection_prompt = f"{context}\n\nReflect on progress. Are you on track? Any obstacles? Does the plan need adjustment? What's next?"
+        system_prompt = "You are a self-reflecting agent evaluating task progress."
+
+        reflection_response = await self.llm.generate(prompt=reflection_prompt, system_prompt=system_prompt, temperature=0.3)
         reflection_text = reflection_response.get("content", "")
-        
-        # Store the reflection
-        self.execution_state["reflections"].append({
-            "iteration": self.current_iteration,
-            "reflection": reflection_text
-        })
-        
-        # Check if we need to update the plan
-        if "plan needs adjustment" in reflection_text.lower() or "adjust the plan" in reflection_text.lower():
-            # Extract the remaining task if possible
-            remaining_task = self.state["task"]
-            if self.execution_state["completed_steps"]:
-                remaining_task = f"Original task: {self.state['task']}\n\nProgress so far: {', '.join(self.execution_state['completed_steps'])}\n\nComplete the remaining work."
-            
-            # Create a new plan for the remaining work
-            new_plan = await self._create_plan(remaining_task, depth=1)
-            
-            # Update the plan, keeping the completed steps
-            self.execution_state["plan"] = {
-                "reasoning": new_plan["reasoning"],
-                "steps": self.execution_state["completed_steps"] + new_plan["steps"],
-                "created_at": time.time(),
-                "adjusted": True
-            }
-            
-            logger.info(f"Plan adjusted at iteration {self.current_iteration}")
-    
+        self.execution_state["reflections"].append({"iteration": self.current_iteration, "reflection": reflection_text})
+        logger.debug(f"[{self.name}] Reflection: {reflection_text[:200]}...")
+
+        # Basic check for plan adjustment trigger words
+        if "adjust plan" in reflection_text.lower() or "new plan" in reflection_text.lower() or "revise plan" in reflection_text.lower():
+            logger.info(f"[{self.name}] Reflection suggests plan adjustment.")
+            current_progress_summary = self._summarize_progress_for_replan()
+            remaining_task_desc = f"Original Task: {self.state['task']}\nProgress Summary: {current_progress_summary}\nObjective: Complete the original task based on this progress."
+            try:
+                 new_plan = await self._create_plan(remaining_task_desc, depth=1) # Limit recursion depth
+                 self.execution_state["plan"] = new_plan # Replace the plan entirely
+                 self.execution_state["completed_steps"] = [] # Reset completed steps relative to new plan
+                 self.execution_state["current_step"] = self._get_next_plan_step() # Set current step for new plan
+                 logger.info(f"[{self.name}] Plan adjusted based on reflection.")
+            except Exception as e:
+                 logger.error(f"[{self.name}] Failed to create adjusted plan during reflection: {e}")
+
+
+    def _summarize_progress_for_replan(self) -> str:
+         """Creates a concise summary of completed steps and tool results for replanning."""
+         summary_parts = []
+         if self.execution_state.get("completed_steps"):
+              summary_parts.append("Completed Steps: " + ", ".join(self.execution_state["completed_steps"]))
+         if self.execution_state.get("tool_results"):
+              summary_parts.append("Recent Tool Results Summary:")
+              for res in self.execution_state["tool_results"][-2:]: # Limit context
+                   outcome = "Success" if "error" not in res.get("output", {}) else "Error"
+                   preview = str(res.get("output",{}).get("result", res.get("output",{}).get("error", "")))[:100]
+                   summary_parts.append(f"- {res['tool']}: {outcome} ({preview}...)")
+         return "\n".join(summary_parts) if summary_parts else "No significant progress yet."
+
+
     async def _generate_final_response(self, task: str) -> str:
-        """
-        Generate a final response to the user based on the task and execution state.
-        
-        Args:
-            task: The original task
-            
-        Returns:
-            Final response to the user
-        """
+        """(Async) Generate final response."""
+        # (Implementation remains largely the same as provided before, ensure LLM call is awaited)
         context = self._prepare_execution_context()
-        
-        final_prompt = (
-            f"{context}\n\n"
-            f"The task has been completed or the maximum number of iterations has been reached. "
-            f"Generate a final response to the user that summarizes what was accomplished, "
-            f"what information was gathered, and the final result or recommendation."
-        )
-        
-        final_response = await self.llm.generate(
-            prompt=final_prompt,
-            system_prompt="You are a helpful assistant that provides clear, concise summaries of completed tasks.",
-            temperature=0.5
-        )
-        
-        return final_response.get("content", "I've completed the task to the best of my ability.")
-    
+        final_prompt = f"{context}\n\nTask is finished or max iterations reached. Generate a final, comprehensive response for the user summarizing the outcome."
+        system_prompt = "You summarize the results of an autonomous agent's work."
+
+        final_response = await self.llm.generate(prompt=final_prompt, system_prompt=system_prompt, temperature=0.5)
+        return final_response.get("content", "Task processing is complete.")
+
+
     def _prepare_execution_context(self) -> str:
-        """
-        Prepare the execution context for prompts based on current state.
-        
-        Returns:
-            Formatted context string
-        """
-        context = [f"Task: {self.state['task']}"]
-        
-        # Include plan
-        if self.execution_state["plan"]:
-            plan = self.execution_state["plan"]
-            context.append("\nPlan:")
-            if plan.get("reasoning"):
-                context.append(f"Reasoning: {plan['reasoning']}")
-            
-            context.append("Steps:")
-            for i, step in enumerate(plan["steps"], 1):
-                # Mark completed steps
-                if step in self.execution_state["completed_steps"]:
-                    context.append(f"{i}. [✓] {step}")
-                elif step == self.execution_state["current_step"]:
-                    context.append(f"{i}. [Current] {step}")
-                else:
-                    context.append(f"{i}. {step}")
-        
-        # Include tool execution history
-        if self.execution_state["tool_results"]:
-            context.append("\nTool Execution History:")
-            for i, result in enumerate(self.execution_state["tool_results"], 1):
-                context.append(f"{i}. Tool: {result['tool']}")
-                context.append(f"   Input: {result['input']}")
-                context.append(f"   Result: {result['result']}")
-        
-        # Include recent reflections (last one only to save space)
-        if self.execution_state["reflections"]:
-            recent_reflection = self.execution_state["reflections"][-1]
-            context.append(f"\nLast Reflection (Iteration {recent_reflection['iteration']}):")
-            context.append(recent_reflection["reflection"])
-        
-        # Include iteration count
-        context.append(f"\nCurrent Iteration: {self.current_iteration}/{self.max_iterations}")
-        
+        """Prepare context string for LLM prompts. (Synchronous)"""
+        # (Implementation remains largely the same as provided before)
+        context = [f"## Current Task:\n{self.state.get('task', 'N/A')}"]
+
+        plan = self.execution_state.get("plan")
+        if plan and plan.get("steps"):
+             context.append("\n## Current Plan:")
+             if plan.get("reasoning"): context.append(f"Reasoning: {plan['reasoning']}")
+             context.append("Steps:")
+             current_step_found = False
+             for i, step in enumerate(plan["steps"]):
+                  prefix = f"{i+1}."
+                  status = ""
+                  if step in self.execution_state.get("completed_steps", []): status = "[✓ DONE]"
+                  elif step == self.execution_state.get("current_step") and not current_step_found:
+                       status = "[▶ CURRENT]"
+                       current_step_found = True
+                  context.append(f"  {prefix} {status} {step}")
+             if not current_step_found and self.execution_state.get("current_step"):
+                  # If current step isn't in the plan list, mention it
+                  context.append(f"  [▶ CURRENT] {self.execution_state['current_step']} (Potentially deviated from plan)")
+
+
+        tool_results = self.execution_state.get("tool_results", [])
+        if tool_results:
+             context.append("\n## Recent Tool Execution History (Max 3):")
+             for result in tool_results[-3:]: # Show only last few tool calls
+                  outcome = result.get("output", {})
+                  result_preview = str(outcome.get("result", outcome.get("error", "No result/error provided")))[:150]
+                  context.append(f"- **Iteration {result['iteration']}**: Ran `{result['tool']}` with input `{str(result['input'])[:50]}...` -> Outcome: `{result_preview}...`")
+
+
+        reflections = self.execution_state.get("reflections", [])
+        if reflections:
+             last_reflection = reflections[-1]
+             context.append(f"\n## Last Reflection (Iteration {last_reflection['iteration']}):\n{last_reflection['reflection'][:300]}...") # Truncate reflection
+
+        context.append(f"\n## Current Status:\nIteration {self.current_iteration}/{self.max_iterations}")
+
         return "\n".join(context)
-    
+
+    def _get_next_plan_step(self) -> Optional[str]:
+         """Gets the next step from the plan that hasn't been completed."""
+         plan_steps = self.execution_state.get("plan", {}).get("steps", [])
+         completed = self.execution_state.get("completed_steps", [])
+         for step in plan_steps:
+              if step not in completed:
+                   return step
+         return None # All plan steps completed
+
+
     def reset(self) -> None:
         """Reset the agent's state for a new run."""
-        super().reset()
-        
+        # Use await if BaseAgent.reset becomes async
+        super().reset() # Resets iteration, finished, base state, memory
         self.execution_state = {
             "plan": None,
             "current_step": None,
@@ -532,20 +460,11 @@ class AutonomousAgent(BaseAgent):
             "tool_results": [],
             "reflections": []
         }
-    
+        if self.verbose:
+            logger.info(f"Reset agent '{self.name}' execution state.")
+
     async def chat(self, message: str, **kwargs) -> str:
-        """
-        Simple interface for chat-based interactions.
-        
-        This method provides a simpler interface for chat-based interactions,
-        returning just the text response.
-        
-        Args:
-            message: User message
-            **kwargs: Additional parameters for the run method
-            
-        Returns:
-            The agent's text response
-        """
+        """Simple async interface for chat-based interactions."""
+        # Ensure BaseAgent.chat is async if it calls self.run
         result = await self.run(message, **kwargs)
-        return result.get("response", "I'm not sure how to respond to that.")
+        return result.get("response", "I encountered an issue and couldn't generate a response.")
