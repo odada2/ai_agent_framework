@@ -1,0 +1,1 @@
+echo "This is a test file for the AI agent framework." > test_file.txt

@@ -8,9 +8,11 @@ Use these tools with caution due to potential security implications.
 """
 
 from .read import FileReadTool
-from .write import FileWriteTool # Add the new import
+from .write import FileWriteTool
+from .list_dir import ListDirectoryTool # <-- Add import
 
 __all__ = [
     'FileReadTool',
-    'FileWriteTool', # Add the new tool to exports
+    'FileWriteTool',
+    'ListDirectoryTool', # <-- Add to exports
 ]

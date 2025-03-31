@@ -338,3 +338,4 @@ class AgentProtocol:
                 self._session = None
                 logger.info(f"[{self.own_id}] Closed aiohttp session.")
         logger.info(f"[{self.own_id}] AgentProtocol shutdown complete.")
+        

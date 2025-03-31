@@ -6,11 +6,18 @@ Tool Registry
 This module provides a registry for managing and accessing tools asynchronously.
 """
 
-import asyncio # Import asyncio
+import asyncio
 import logging
+import json # <-- IMPORT ADDED HERE
 from typing import Any, Dict, List, Optional, Union
 
-from .base import BaseTool
+# Assuming BaseTool can be imported correctly
+try:
+    from .base import BaseTool
+except ImportError:
+    # Fallback for different execution contexts
+    from core.tools.base import BaseTool
+
 
 logger = logging.getLogger(__name__)
 
@@ -45,6 +52,7 @@ class ToolRegistry:
              raise ValueError("Tool must have a valid string name.")
 
         if tool.name in self._tools:
+            # Allow overriding/updating if needed? For now, raise error.
             raise ValueError(f"A tool with name '{tool.name}' is already registered")
 
         self._tools[tool.name] = tool
@@ -64,23 +72,27 @@ class ToolRegistry:
         Remove a tool from the registry. (Synchronous)
         """
         if tool_name not in self._tools:
-            raise ValueError(f"Tool '{tool_name}' is not registered")
+            # Optionally return False or log warning instead of raising error
+            logger.warning(f"Attempted to unregister non-existent tool: {tool_name}")
+            return # Or raise ValueError(f"Tool '{tool_name}' is not registered")
 
         # Remove from categories
-        categories_to_update = []
+        categories_to_remove_from = []
         for category, tools_in_cat in self._categories.items():
             if tool_name in tools_in_cat:
                 tools_in_cat.remove(tool_name)
                 if not tools_in_cat: # Check if category is now empty
-                     categories_to_update.append(category)
+                     categories_to_remove_from.append(category)
 
         # Remove empty categories
-        for category in categories_to_update:
-             del self._categories[category]
+        for category in categories_to_remove_from:
+             if category in self._categories: # Check existence before deleting
+                  del self._categories[category]
 
         # Remove from tools map
-        del self._tools[tool_name]
-        logger.debug(f"Unregistered tool: {tool_name}")
+        if tool_name in self._tools:
+             del self._tools[tool_name]
+             logger.debug(f"Unregistered tool: {tool_name}")
 
     def get_tool(self, tool_name: str) -> BaseTool:
         """
@@ -95,7 +107,6 @@ class ToolRegistry:
         """Check if a tool is registered. (Synchronous)"""
         return tool_name in self._tools
 
-    # Make execute_tool asynchronous
     async def execute_tool(self, tool_name: str, **kwargs) -> Any:
         """
         Execute a tool asynchronously by name with the provided parameters.
@@ -105,15 +116,20 @@ class ToolRegistry:
             **kwargs: Parameters to pass to the tool's execute method.
 
         Returns:
-            The result of the tool execution.
+            The result of the tool execution, or an error dictionary.
 
         Raises:
             ValueError: If the tool is not registered.
-            ToolError: Or other exceptions raised by the tool's execute method.
         """
-        tool = self.get_tool(tool_name) # get_tool is sync
+        try:
+            tool = self.get_tool(tool_name) # get_tool is sync and raises ValueError if not found
+        except ValueError as e:
+            logger.error(f"Cannot execute tool: {e}")
+            return {"error": str(e)} # Return error dict for consistency with BaseTool.execute
+
         logger.debug(f"Executing tool asynchronously: {tool_name}")
         # Await the tool's async execute method
+        # BaseTool.execute now catches exceptions and returns an error dict
         return await tool.execute(**kwargs)
 
     # Methods below remain synchronous as they only read internal state
@@ -147,13 +163,13 @@ class ToolRegistry:
             List of tool definition dictionaries.
         """
         target_tools = []
-        if tool_names is None:
-            target_tools = self._tools.values()
-        else:
-            target_tools = [self.get_tool(name) for name in tool_names if self.has_tool(name)]
-            if len(target_tools) != len(tool_names):
-                 missing = set(tool_names) - set(t.name for t in target_tools)
-                 logger.warning(f"Requested tool definitions for unknown tools: {missing}")
+        names_to_get = tool_names if tool_names is not None else self.get_tool_names()
+
+        for name in names_to_get:
+             try:
+                  target_tools.append(self.get_tool(name))
+             except ValueError:
+                  logger.warning(f"Requested tool definition for unknown tool: {name}")
 
         return [tool.get_definition() for tool in target_tools]
 
@@ -181,6 +197,7 @@ class ToolRegistry:
                     param_desc = param_info.get("description", "")
                     req_str = "required" if param_name in required else "optional"
                     default_val = param_info.get("default")
+                    # Use json.dumps for default value formatting
                     default_str = f" (default: {json.dumps(default_val)})" if default_val is not None else ""
                     enum_str = f" (options: {', '.join(map(str, param_info['enum']))})" if "enum" in param_info else ""
 

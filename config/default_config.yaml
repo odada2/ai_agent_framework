@@ -1,190 +1,192 @@
+# ai_agent_framework/config/default_config.yaml
+# Updated to default to OpenAI
+
 ###################################
 # Default Configuration
 ###################################
 
 # System-wide settings
 system:
-  name: "agent-orchestration-system"
-  version: "1.0.0"
-  log_level: "INFO"
+  name: "ai_agent_framework" # Changed to match package name
+  version: "0.1.0" # Consider updating if making significant changes
+  log_level: "INFO" # Default log level (can be overridden by CLI/env)
   environment: "development"  # development, staging, production
+  verbose: false # Default verbosity for agents/workflows
 
-# Agent settings
+# Default LLM settings (Used by LLMFactory if not specified elsewhere)
+llm:
+  provider: "openai" # Changed default provider
+  model: "gpt-3.5-turbo" # Specify a default OpenAI model
+  temperature: 0.7
+
+# Agent settings (Defaults for different agent types if specific config not loaded)
+# Individual agents might still override these via their specific init logic or runtime args
 agents:
-  # Task execution agent
-  task_executor:
-    type: "agents.executor.TaskExecutorAgent"
-    capabilities:
-      - "task_execution"
-      - "data_processing"
-    max_concurrent_tasks: 5
-    timeout: 300  # seconds
-    retry_delay: 5
-
-  # Data processing agent
-  data_processor:
-    type: "agents.processor.DataProcessorAgent"
-    capabilities:
-      - "data_processing"
-      - "data_transformation"
-      - "data_validation"
-    max_concurrent_tasks: 3
-    timeout: 600  # seconds
-    retry_delay: 10
-
-  # API agent for external services
-  api_agent:
-    type: "agents.external.APIAgent"
-    capabilities:
-      - "api_integration"
-      - "external_communication"
-    max_concurrent_tasks: 10
-    timeout: 120  # seconds
-    retry_delay: 3
-    rate_limit: 100  # requests per minute
-
-  # Supervisor agent
-  supervisor:
-    type: "agents.supervisor.SupervisorAgent"
+  workflow: # Settings specifically for WorkflowAgent
+    system_prompt: null # Default is often handled within the agent itself
+    max_iterations: 10
+  autonomous: # Settings specifically for AutonomousAgent
+    system_prompt: null # Default is often handled within the agent itself
+    max_iterations: 15
+    reflection_threshold: 3
+  supervisor: # Settings specifically for SupervisorAgent
+    system_prompt: null
     max_retries: 3
     retry_delay: 5
-    monitoring_interval: 30  # seconds
+    task_timeout: 60.0 # Default timeout for delegated tasks
+    monitoring_interval: 30
 
-# Orchestration configuration
+# Tool configurations (Enable/disable flags and specific settings)
+tools:
+  filesystem:
+    enabled: false # Default to disabled for safety, override with flags/env/user config
+    allowed_directories: ["."] # Default relative path, USE WITH CAUTION, override in secure config
+    allow_write: false # Default write to disabled for safety
+  web_search:
+    enabled: false # Default to disabled, override with flags/env/user config
+    # Provider-specific configs can go under here, matched by provider name
+    # e.g., serper: { api_key_env: "SERPER_API_KEY" }
+    # These would typically be loaded from user config or .env, not hardcoded here
+    providers: {} # Placeholder for provider-specific settings
+  data_analysis:
+    enabled: false # Default to disabled (requires pandas), override with flags/env/user config
+  knowledge_base:
+    enabled: false # Default RAG to disabled
+    persist_path: "./data/kb" # Default location for KB vector store
+    collection_name: "default_kb"
+    retrieval_k: 3 # Default number of documents to retrieve
+  conversation_memory:
+    search_enabled: false # Default conversation search to disabled
+    # embedding_type: "openai" # Or inherit from vector_store.embedding_type
+    # vector_store_type: "faiss" # Default for conversation history search
+  apis:
+    # Configuration for specific APIConnectorTool instances
+    # Loaded by name when setting up tools
+    connectors: {}
+    # Example:
+    # connectors:
+    #   weather_api:
+    #     description: "Get current weather data"
+    #     base_url: "https://api.weatherapi.com/v1"
+    #     auth_config:
+    #       type: "header" # or 'bearer', 'basic'
+    #       name: "key"   # Header name for API key
+    #       value: null   # Value loaded from env/secrets (e.g., WEATHER_API_KEY)
+
+# Vector Store configuration (Used by Knowledge Base, Memory Search)
+vector_store:
+  type: "chroma" # Default vector store type ('chroma' or 'faiss')
+  embedding_type: "openai" # Default embedder ('openai' or 'local')
+  # Add specific config for local embedder if needed
+  # local_embedder:
+  #   model_name: "all-MiniLM-L6-v2"
+  #   use_gpu: false
+
+# Cache configuration (Used by Web Search caching)
+cache:
+  web_search:
+    enabled: true # Enable caching for web search by default
+    type: "memory" # 'memory' or 'redis'
+    ttl_seconds: 3600 # 1 hour default TTL
+    serializer: "pickle" # 'pickle' or 'json'
+  redis: # Settings if cache.web_search.type is 'redis'
+    host: "localhost"
+    port: 6379
+    db: 0
+    password: null # Load from env/secrets if needed
+
+# State Management (e.g., for Conversation Memory in API)
+storage: # Renamed from 'storage' in original to avoid conflict with generic storage section below
+  redis: # Specific settings for Redis state manager
+    enabled: false # Default to disabled
+    host: "localhost"
+    port: 6379
+    db: 1 # Use a different DB than cache maybe?
+    password: null # Load from env/secrets
+    session_ttl: 86400 # TTL for conversation memory in seconds (e.g., 1 day)
+
+
+# Orchestration configuration (Structure kept from original)
 orchestration:
-  # Max number of concurrent workflows
   max_concurrent_workflows: 10
-  
-  # Retry configuration
   max_retries: 3
-  retry_delay: 5  # seconds
-  
-  # Monitoring interval
-  monitoring_interval: 10  # seconds
-  
-  # Task prioritization strategy
-  # Options: fifo, deadline, priority
+  retry_delay: 5.0 # Ensure float
+  monitoring_interval: 10.0 # Ensure float
   priority_strategy: "fifo"
-  
-  # Worker selection strategy
-  # Options: round_robin, least_loaded, capability_match
   worker_selection_strategy: "capability_match"
-  
-  # Fault tolerance settings
   enable_fault_tolerance: true
-  heartbeat_timeout: 300  # seconds (5 minutes)
-  
-  # Default workflow timeout
-  default_workflow_timeout: 3600  # seconds (1 hour)
-  
-  # Worker nodes configuration
-  workers:
-    - id: "worker-1"
-      endpoint: "http://localhost:8001/api/worker"
-      capabilities:
-        - "task_execution"
-        - "data_processing"
-      max_concurrent_tasks: 5
-    
-    - id: "worker-2"
-      endpoint: "http://localhost:8002/api/worker"
-      capabilities:
-        - "data_processing"
-        - "data_transformation"
-        - "data_validation"
-      max_concurrent_tasks: 3
-    
-    - id: "worker-3"
-      endpoint: "http://localhost:8003/api/worker"
-      capabilities:
-        - "api_integration"
-        - "external_communication"
-      max_concurrent_tasks: 10
+  heartbeat_timeout: 300.0
+  default_workflow_timeout: 3600.0
+  default_task_timeout: 300.0 # Added default task timeout
+  workers: [] # Define actual workers in user config or via registration
+  # Example worker definition:
+  # workers:
+  #   - id: "worker-1"
+  #     endpoint: "http://localhost:8001/api/worker"
+  #     capabilities: ["task_execution", "data_processing"]
+  #     max_concurrent_tasks: 5
 
-# Communication settings
+# Communication settings (Structure kept from original)
 communication:
-  # Protocol settings
   protocol:
-    request_timeout: 30  # seconds
-    max_retries: 3
-    retry_backoff: 2.0  # exponential backoff factor
-  
-  # Security settings
-  security:
-    enable_encryption: true
-    encryption_algorithm: "AES-256"
-    enable_authentication: true
-    token_expiration: 3600  # seconds
-  
-  # Message queue settings
-  queue:
-    max_queue_size: 1000
-    processing_threads: 4
-    message_ttl: 300  # seconds
+    request_timeout: 30.0 # Default timeout for protocol send/receive
+    max_retries: 3 # Retries within protocol send
+    retry_backoff: 2.0
+  # Security settings might be handled externally (e.g., HTTPS, network policies)
+  # security:
+  #   enable_encryption: false # Example
+  #   enable_authentication: false # Example
+  # Message queue settings (If using an external queue, not default HTTP)
+  # queue:
+  #   max_queue_size: 1000
+  #   message_ttl: 300
 
-# Storage settings
-storage:
-  # Database settings
-  database:
-    type: "sqlite"  # sqlite, postgresql, mongodb
-    path: "./data/storage.db"
-    connection_timeout: 30
-    connection_retries: 3
-  
-  # File storage settings
-  file_storage:
-    path: "./data/files"
-    max_size: 1073741824  # 1GB in bytes
+# Generic Storage settings (Structure kept from original)
+# Note: This seemed less used by core framework, maybe for specific tools/agents
+# storage:
+#   database:
+#     type: "sqlite"
+#     path: "./data/storage.db"
+#     connection_timeout: 30
+#   file_storage:
+#     path: "./data/files"
+#     max_size: 1073741824
 
-# Logging configuration
+# Logging configuration (Defaults set here, setup applies them)
+# logging_config.py provides more detailed structure, this is high-level override
 logging:
   console:
     enabled: true
-    level: "INFO"
-    format: "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
-  
+    level: "INFO" # Overridden by system.log_level or CLI --log-level
   file:
     enabled: true
     level: "DEBUG"
-    path: "./logs/application.log"
-    max_size: 10485760  # 10MB in bytes
+    path: "./logs/application.log" # setup_logging will use log_dir arg
+    max_size: 10485760
     backup_count: 5
-    format: "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
-  
-  telemetry:
-    enabled: true
-    level: "INFO"
-    endpoint: "http://localhost:9000/telemetry"
+  # telemetry config removed as it wasn't fully implemented
 
-# Task execution settings
-task_execution:
-  # Task timeout settings
-  default_timeout: 300  # seconds
-  max_timeout: 1800  # seconds (30 minutes)
-  
-  # Resource limits
-  cpu_limit: 0.8  # percentage of CPU resources
-  memory_limit: 1073741824  # 1GB in bytes
-  
-  # Dependency resolution
-  resolve_dependencies: true
-  dependency_resolution_timeout: 120  # seconds
+# Task execution settings (Structure kept from original)
+# These seem more relevant to worker implementation than orchestrator defaults
+# task_execution:
+#   default_timeout: 300
+#   max_timeout: 1800
+#   resource_limits:
+#     cpu_limit: 0.8
+#     memory_limit: 1073741824
+#   dependency_resolution:
+#     resolve_dependencies: true
+#     dependency_resolution_timeout: 120
 
-# Security settings
-security:
-  # Authentication
-  authentication:
-    enabled: true
-    provider: "jwt"  # jwt, oauth2, basic
-    token_expiration: 3600  # seconds
-  
-  # Authorization
-  authorization:
-    enabled: true
-    default_policy: "deny"  # deny, allow
-  
-  # Encryption
-  encryption:
-    enabled: true
-    algorithm: "AES-256"
-    key_rotation_interval: 86400  # seconds (1 day)
+# Security settings (Structure kept from original)
+# High-level flags, implementation details external
+# security:
+#   authentication:
+#     enabled: true
+#     provider: "jwt"
+#   authorization:
+#     enabled: true
+#     default_policy: "deny"
+#   encryption:
+#     enabled: true
+#     algorithm: "AES-256"
